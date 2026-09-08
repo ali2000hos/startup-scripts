@@ -107,8 +107,10 @@ if [[ -f "$ENV_FILE" ]]; then
   echo "   It holds N8N_ENCRYPTION_KEY, which decrypts every stored credential."
   echo "   Regenerating it would make all existing credentials unreadable."
   if ask_yn "Keep the existing secrets and only update the configuration?" "y"; then
-    # shellcheck disable=SC1090
-    set -a; . "$ENV_FILE"; set +a
+    set -a
+    # shellcheck source=/dev/null
+    . "$ENV_FILE"
+    set +a
     REUSED_ENV=true
     log_success "Existing secrets loaded."
   else
@@ -185,7 +187,7 @@ echo "  editor responsive under heavy load and lets executions survive a"
 echo "  restart of the main process. Not needed for light or moderate use —"
 echo "  you can switch it on later without touching the database."
 QUEUE_MODE=false
-ask_yn "Enable queue mode (Redis + worker) now?" "n" && QUEUE_MODE=true
+if ask_yn "Enable queue mode (Redis + worker) now?" "n"; then QUEUE_MODE=true; fi
 
 # --- SMTP ----------------------------------------------------------
 echo ""
@@ -210,14 +212,14 @@ BACKUP_ENABLED=true
 ask_yn "Enable nightly backups at 02:00 (database + credential key + files)?" "y" \
   || BACKUP_ENABLED=false
 BACKUP_RETAIN_DAYS=7
-$BACKUP_ENABLED && BACKUP_RETAIN_DAYS=$(ask "Keep backups for how many days?" "7")
+if $BACKUP_ENABLED; then BACKUP_RETAIN_DAYS=$(ask "Keep backups for how many days?" "7"); fi
 
 echo ""
 echo "  Unattended updates pull the newest image on a schedule. This script's"
 echo "  update job takes a backup first and rolls back if n8n fails to come up,"
 echo "  but an update you are not watching is still an update you cannot debug."
 AUTOUPDATE_ENABLED=false
-ask_yn "Enable weekly automatic updates (Sunday 04:00)?" "n" && AUTOUPDATE_ENABLED=true
+if ask_yn "Enable weekly automatic updates (Sunday 04:00)?" "n"; then AUTOUPDATE_ENABLED=true; fi
 
 # --- Confirm -------------------------------------------------------
 echo ""
@@ -717,8 +719,9 @@ log "Data volume archived."
 
 cp "${PROJECT_DIR}/.env" "${STAGING}/env.backup"
 cp "${PROJECT_DIR}/compose.yaml" "${STAGING}/compose.yaml"
-[ -d "${PROJECT_DIR}/local-files" ] && \
+if [ -d "${PROJECT_DIR}/local-files" ]; then
   tar czf "${STAGING}/local-files.tar.gz" -C "${PROJECT_DIR}" local-files
+fi
 
 ARCHIVE="${BACKUP_DIR}/n8n_backup_${TIMESTAMP}.tar.gz"
 tar czf "$ARCHIVE" -C "$STAGING" .
@@ -731,7 +734,7 @@ fi
 log "Backup written: ${ARCHIVE} ($(du -h "$ARCHIVE" | cut -f1))"
 
 DELETED=$(find "$BACKUP_DIR" -name 'n8n_backup_*.tar.gz' -mtime "+${RETAIN_DAYS}" -print -delete | wc -l)
-[ "$DELETED" -gt 0 ] && log "Removed ${DELETED} backup(s) older than ${RETAIN_DAYS} days."
+if [ "$DELETED" -gt 0 ]; then log "Removed ${DELETED} backup(s) older than ${RETAIN_DAYS} days."; fi
 
 log "Backup completed."
 log "===================================="
