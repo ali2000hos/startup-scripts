@@ -116,6 +116,13 @@ if [[ -f "$ENV_FILE" ]]; then
   else
     ask_yn "This DESTROYS access to existing credentials. Are you certain?" "n" \
       || die "Aborted by user. Nothing was changed."
+    if docker volume inspect n8n_db_storage &>/dev/null; then
+      log_warn "The n8n_db_storage volume from the previous install still exists."
+      echo "   Postgres only sets passwords when its data directory is empty, so new"
+      echo "   secrets will not match the roles already stored in that volume."
+      ask_yn "Delete the n8n_db_storage volume too, so the new secrets take effect?" "y" \
+        && docker volume rm n8n_db_storage &>/dev/null
+    fi
     cp "$ENV_FILE" "${ENV_FILE}.replaced.$(date +%s)"
     log_warn "Old .env kept as ${ENV_FILE}.replaced.*"
   fi
@@ -180,6 +187,24 @@ echo "  'stable' tracks the latest stable release. Pinning an exact version"
 echo "  (e.g. 1.80.0) means no surprise upgrades on restart."
 N8N_VERSION=$(ask "n8n image tag" "${N8N_VERSION:-stable}")
 
+# Detect what a previous, possibly interrupted, run already had configured.
+# A re-run must default to preserving that, not to the plain first-run
+# defaults — otherwise accepting "n" here silently rips a working queue mode
+# or SMTP setup out of the compose file on the next apply.
+QUEUE_DEFAULT="n"; SMTP_DEFAULT="n"; BACKUP_DEFAULT="y"; AUTOUPDATE_DEFAULT="n"
+PREV_RETAIN_DAYS="7"
+if [[ -f "$COMPOSE_FILE" ]]; then
+  if grep -q 'n8n-worker' "$COMPOSE_FILE" 2>/dev/null; then QUEUE_DEFAULT="y"; fi
+  if grep -q 'N8N_EMAIL_MODE' "$COMPOSE_FILE" 2>/dev/null; then SMTP_DEFAULT="y"; fi
+fi
+if [[ -f /etc/cron.d/n8n-backup ]]; then
+  BACKUP_DEFAULT="y"
+  PREV_RETAIN_DAYS=$(grep -oP 'RETAIN_DAYS=\K[0-9]+' /etc/cron.d/n8n-backup 2>/dev/null || echo "7")
+elif [[ -f "$COMPOSE_FILE" ]]; then
+  BACKUP_DEFAULT="n"
+fi
+if [[ -f /etc/cron.d/n8n-update ]]; then AUTOUPDATE_DEFAULT="y"; fi
+
 # --- Queue mode ----------------------------------------------------
 echo ""
 echo "  Queue mode adds Redis and a separate worker container. It keeps the"
@@ -187,7 +212,7 @@ echo "  editor responsive under heavy load and lets executions survive a"
 echo "  restart of the main process. Not needed for light or moderate use —"
 echo "  you can switch it on later without touching the database."
 QUEUE_MODE=false
-if ask_yn "Enable queue mode (Redis + worker) now?" "n"; then QUEUE_MODE=true; fi
+if ask_yn "Enable queue mode (Redis + worker) now?" "$QUEUE_DEFAULT"; then QUEUE_MODE=true; fi
 
 # --- SMTP ----------------------------------------------------------
 echo ""
@@ -195,12 +220,17 @@ echo "  SMTP is what n8n uses for user invites and password resets."
 echo "  It is unrelated to the free community licence key, which n8n's own"
 echo "  servers email you from inside the UI."
 SMTP_ENABLED=false
-if ask_yn "Configure SMTP now?" "n"; then
+if ask_yn "Configure SMTP now?" "$SMTP_DEFAULT"; then
   SMTP_ENABLED=true
   N8N_SMTP_HOST=$(ask "SMTP host" "${N8N_SMTP_HOST:-}")
   N8N_SMTP_PORT=$(ask "SMTP port (587 = STARTTLS, 465 = implicit TLS)" "${N8N_SMTP_PORT:-587}")
   N8N_SMTP_USER=$(ask "SMTP username" "${N8N_SMTP_USER:-}")
-  read -rsp "$(echo -e "${BOLD}?${NC} SMTP password: ")" N8N_SMTP_PASS; echo ""
+  if [[ -n "${N8N_SMTP_PASS:-}" ]]; then
+    read -rsp "$(echo -e "${BOLD}?${NC} SMTP password [keep existing]: ")" NEW_SMTP_PASS; echo ""
+    N8N_SMTP_PASS="${NEW_SMTP_PASS:-$N8N_SMTP_PASS}"
+  else
+    read -rsp "$(echo -e "${BOLD}?${NC} SMTP password: ")" N8N_SMTP_PASS; echo ""
+  fi
   N8N_SMTP_SENDER=$(ask "Sender address (must be verified with your provider)" "${N8N_SMTP_SENDER:-}")
   if [[ "$N8N_SMTP_PORT" == "465" ]]; then N8N_SMTP_SSL=true; else N8N_SMTP_SSL=false; fi
   log_info "N8N_SMTP_SSL set to ${N8N_SMTP_SSL} to match port ${N8N_SMTP_PORT}."
@@ -209,17 +239,17 @@ fi
 # --- Maintenance ---------------------------------------------------
 echo ""
 BACKUP_ENABLED=true
-ask_yn "Enable nightly backups at 02:00 (database + credential key + files)?" "y" \
+ask_yn "Enable nightly backups at 02:00 (database + credential key + files)?" "$BACKUP_DEFAULT" \
   || BACKUP_ENABLED=false
 BACKUP_RETAIN_DAYS=7
-if $BACKUP_ENABLED; then BACKUP_RETAIN_DAYS=$(ask "Keep backups for how many days?" "7"); fi
+if $BACKUP_ENABLED; then BACKUP_RETAIN_DAYS=$(ask "Keep backups for how many days?" "$PREV_RETAIN_DAYS"); fi
 
 echo ""
 echo "  Unattended updates pull the newest image on a schedule. This script's"
 echo "  update job takes a backup first and rolls back if n8n fails to come up,"
 echo "  but an update you are not watching is still an update you cannot debug."
 AUTOUPDATE_ENABLED=false
-if ask_yn "Enable weekly automatic updates (Sunday 04:00)?" "n"; then AUTOUPDATE_ENABLED=true; fi
+if ask_yn "Enable weekly automatic updates (Sunday 04:00)?" "$AUTOUPDATE_DEFAULT"; then AUTOUPDATE_ENABLED=true; fi
 
 # --- Confirm -------------------------------------------------------
 echo ""
@@ -948,7 +978,7 @@ LOGROTATEEOF
 # ------------------------------------------------------------------
 log_step "Step 12: Starting services"
 # ------------------------------------------------------------------
-docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --remove-orphans
 
 log_info "Waiting for n8n to become available..."
 ELAPSED=0
