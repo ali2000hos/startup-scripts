@@ -90,7 +90,11 @@ ADMIN_USER=""
 if ask_yn "Create (or configure) a sudo user?" "y"; then
   CREATE_USER=true
   while true; do
-    ADMIN_USER=$(ask "Username")
+    ADMIN_USER=$(ask "Username (blank to skip)")
+    if [[ -z "$ADMIN_USER" ]]; then
+      CREATE_USER=false
+      break
+    fi
     if [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
       break
     fi
@@ -209,7 +213,7 @@ echo "  Sudo user:       $($CREATE_USER && echo "${ADMIN_USER}" || echo 'none')"
 echo "  SSH port:        ${NEW_SSH_PORT}$([[ "$NEW_SSH_PORT" != "$CURRENT_SSH_PORT" ]] && echo " (changed from ${CURRENT_SSH_PORT})")"
 echo "  Password login:  $($DISABLE_PW && echo 'disabled (key only)' || echo 'enabled')"
 echo "  Root SSH login:  $($DISABLE_ROOT && echo 'disabled' || echo 'enabled')"
-echo "  Firewall:        UFW, SSH${OPEN_WEB:+ + 80/443}${EXTRA_PORTS:+ + ${EXTRA_PORTS}}"
+echo "  Firewall:        UFW, SSH$($OPEN_WEB && echo ' + 80/443')${EXTRA_PORTS:+ + ${EXTRA_PORTS}}"
 echo "  fail2ban:        $($INSTALL_FAIL2BAN && echo yes || echo no)"
 echo "  Auto updates:    $($AUTO_UPDATES && echo "yes$($AUTO_REBOOT && echo ', reboot at 04:00')" || echo no)"
 echo "  Swap:            $($SETUP_SWAP && echo "${SWAP_SIZE_GB} GB" || echo 'unchanged')"
@@ -289,8 +293,11 @@ if $CREATE_USER; then
     adduser --disabled-password --gecos "" "$ADMIN_USER" >/dev/null
     log_success "User ${ADMIN_USER} created."
     if ! $DISABLE_PW; then
-      echo "  Password auth is staying on, so ${ADMIN_USER} needs a password."
-      passwd "$ADMIN_USER"
+      if ask_yn "Set a password for ${ADMIN_USER} now?" "y"; then
+        passwd "$ADMIN_USER" || log_warn "Password not set — run 'sudo passwd ${ADMIN_USER}' later."
+      else
+        log_warn "No password set — ${ADMIN_USER} can't log in with a password yet. Run 'sudo passwd ${ADMIN_USER}' later."
+      fi
     fi
   fi
 
@@ -385,14 +392,16 @@ if $HARDEN_SSH; then
   SOCKET_ACTIVATED=false
   if systemctl is-enabled ssh.socket &>/dev/null; then
     SOCKET_ACTIVATED=true
-    mkdir -p /etc/systemd/system/ssh.socket.d
-    cat > /etc/systemd/system/ssh.socket.d/override.conf <<SOCKEOF
+    if [[ "$NEW_SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
+      mkdir -p /etc/systemd/system/ssh.socket.d
+      cat > /etc/systemd/system/ssh.socket.d/override.conf <<SOCKEOF
 [Socket]
 ListenStream=
 ListenStream=${NEW_SSH_PORT}
 SOCKEOF
-    systemctl daemon-reload
-    log_info "Socket-activated sshd detected — port set on ssh.socket."
+      systemctl daemon-reload
+      log_info "Socket-activated sshd detected — port set on ssh.socket."
+    fi
   fi
 
   if ! sshd -t; then
@@ -409,8 +418,11 @@ rm -rf /etc/ssh
 cp -r "${BACKUP_ROOT}/ssh" /etc/ssh
 rm -f /etc/systemd/system/ssh.socket.d/override.conf
 systemctl daemon-reload
-systemctl restart ssh.socket 2>/dev/null || true
-systemctl restart ssh
+if systemctl is-enabled ssh.socket &>/dev/null; then
+  systemctl restart ssh.socket
+else
+  systemctl restart ssh
+fi
 logger -t ssh-rollback "SSH configuration rolled back by the bootstrap safety net."
 ROLLEOF
   chmod +x /usr/local/sbin/ssh-rollback
@@ -431,8 +443,11 @@ CONFIRMEOF
     && log_success "Rollback armed: SSH reverts in 10 minutes unless you run ssh-confirm." \
     || log_warn "Could not arm the rollback timer — test your login carefully."
 
-  if $SOCKET_ACTIVATED; then systemctl restart ssh.socket; fi
-  systemctl restart ssh
+  if $SOCKET_ACTIVATED && [[ "$NEW_SSH_PORT" != "$CURRENT_SSH_PORT" ]]; then
+    systemctl restart ssh.socket
+  else
+    systemctl restart ssh
+  fi
   log_success "SSH restarted on port ${NEW_SSH_PORT}."
 else
   log_info "SSH left as-is."
