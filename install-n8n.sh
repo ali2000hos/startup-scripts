@@ -546,7 +546,8 @@ docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" config -q \
 log_step "Step 7: Firewall"
 # ------------------------------------------------------------------
 if command -v ufw &>/dev/null; then
-  SSH_PORT=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || echo 22)
+  SSH_PORT=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
+  SSH_PORT="${SSH_PORT:-22}"
   ufw allow "${SSH_PORT}/tcp" >/dev/null   # allowed FIRST, so enabling never locks you out
   ufw allow 80/tcp  >/dev/null
   ufw allow 443/tcp >/dev/null
