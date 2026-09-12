@@ -72,6 +72,11 @@ log_info "Logged in as: $(who am i 2>/dev/null | awk '{print $1}' || echo root)"
 mkdir -p "$BACKUP_ROOT"
 log_success "Config backups will go to ${BACKUP_ROOT}"
 
+AVAIL_MB=$(df -Pm / | awk 'NR==2 {print $4}')
+if (( AVAIL_MB < 1024 )); then
+  log_warn "Only ${AVAIL_MB} MB free on / — package upgrades, swap, and backups below may fail with 'No space left on device'."
+fi
+
 # ------------------------------------------------------------------
 log_step "Step 1: Questions"
 # ------------------------------------------------------------------
@@ -266,18 +271,39 @@ log_success "Timezone set to ${NEW_TZ}, time sync on."
 log_step "Step 5: Swap"
 # ------------------------------------------------------------------
 if $SETUP_SWAP; then
-  if [[ -f /swapfile ]]; then
-    log_warn "/swapfile already exists — leaving it alone."
+  if grep -q '^/swapfile[[:space:]]' /proc/swaps; then
+    log_warn "/swapfile is already active swap — leaving it alone."
   else
-    fallocate -l "${SWAP_SIZE_GB}G" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_SIZE_GB*1024)) status=none
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    # Prefer RAM, but use swap before the OOM killer starts picking victims.
-    sysctl -qw vm.swappiness=10
-    echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
-    log_success "${SWAP_SIZE_GB} GB swap active (swappiness 10)."
+    if [[ -e /swapfile ]]; then
+      log_warn "Removing inactive /swapfile left by an earlier run."
+      rm -f /swapfile
+    fi
+    while true; do
+      AVAIL_MB=$(df -Pm / | awk 'NR==2 {print $4}')
+      NEED_MB=$((SWAP_SIZE_GB * 1024))
+      if (( AVAIL_MB < NEED_MB + 512 )); then
+        log_warn "Only ${AVAIL_MB} MB free on / — not enough for a ${SWAP_SIZE_GB} GB swap file plus headroom."
+      elif fallocate -l "${SWAP_SIZE_GB}G" /swapfile 2>/dev/null \
+             || dd if=/dev/zero of=/swapfile bs=1M count="$NEED_MB" status=none; then
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null
+        swapon /swapfile
+        grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        # Prefer RAM, but use swap before the OOM killer starts picking victims.
+        sysctl -qw vm.swappiness=10
+        echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+        log_success "${SWAP_SIZE_GB} GB swap active (swappiness 10)."
+        break
+      else
+        log_warn "Swap file creation failed."
+        rm -f /swapfile
+      fi
+      if ask_yn "Skip swap and continue with the rest of the setup?" "y"; then
+        log_warn "Continuing without swap."
+        break
+      fi
+      SWAP_SIZE_GB=$(ask "Try a smaller swap size in GB" "1")
+    done
   fi
 else
   log_info "Swap unchanged."
@@ -365,8 +391,17 @@ ufw status numbered | sed 's/^/        /'
 log_step "Step 8: SSH hardening"
 # ------------------------------------------------------------------
 if $HARDEN_SSH; then
-  cp -r /etc/ssh "${BACKUP_ROOT}/ssh"
-  log_success "SSH config backed up."
+  # A dropin from an earlier run means SSH is already hardened. Re-backing-up
+  # /etc/ssh now would capture the hardened config, not the original — and
+  # rewriting ssh-rollback below would make the safety net "restore" the
+  # very config it's supposed to be able to undo. Skip both in that case.
+  ALREADY_HARDENED=false
+  [[ -f "$SSHD_DROPIN" ]] && ALREADY_HARDENED=true
+
+  if ! $ALREADY_HARDENED; then
+    cp -r /etc/ssh "${BACKUP_ROOT}/ssh"
+    log_success "SSH config backed up."
+  fi
 
   mkdir -p /etc/ssh/sshd_config.d
   {
@@ -411,7 +446,8 @@ SOCKEOF
   log_success "sshd configuration validated."
 
   # Safety net: put the old config back automatically unless confirmed.
-  cat > /usr/local/sbin/ssh-rollback <<ROLLEOF
+  if ! $ALREADY_HARDENED; then
+    cat > /usr/local/sbin/ssh-rollback <<ROLLEOF
 #!/bin/bash
 # Restores the pre-hardening SSH configuration.
 rm -rf /etc/ssh
@@ -425,7 +461,8 @@ else
 fi
 logger -t ssh-rollback "SSH configuration rolled back by the bootstrap safety net."
 ROLLEOF
-  chmod +x /usr/local/sbin/ssh-rollback
+    chmod +x /usr/local/sbin/ssh-rollback
+  fi
 
   cat > /usr/local/bin/ssh-confirm <<'CONFIRMEOF'
 #!/bin/bash
