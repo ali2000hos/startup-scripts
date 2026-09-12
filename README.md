@@ -15,28 +15,28 @@ the fixes for those specific failures.
 
 | Script | What it sets up |
 |---|---|
-| [`server-bootstrap/`](server-bootstrap/) | Updates, sudo user, key-only SSH, UFW, fail2ban, automatic security patches, swap, kernel hardening |
-| [`n8n/`](n8n/) | n8n with PostgreSQL, task runner, Nginx + Let's Encrypt, verified backups, safe updates |
+| [`bootstrap-server.sh`](bootstrap-server.sh) | Updates, sudo user, key-only SSH, UFW, fail2ban, automatic security patches, swap, kernel hardening |
+| [`install-n8n.sh`](install-n8n.sh) | n8n with PostgreSQL, task runner, Nginx + Let's Encrypt, verified backups, safe updates |
 
-On a new machine, run `server-bootstrap` first, then whichever service you need.
+On a new machine, run `bootstrap-server.sh` first, then whichever service you need.
 
 ## Quick start
 
 ```bash
 # 1. Harden the server
-wget https://raw.githubusercontent.com/ali2000hos/startup-scripts/main/server-bootstrap/bootstrap-server.sh
+wget https://raw.githubusercontent.com/ali2000hos/startup-scripts/main/bootstrap-server.sh
 sudo bash bootstrap-server.sh
 
 # 2. Confirm you can still log in from a second terminal, then:
 sudo ssh-confirm
 
 # 3. Install a service
-wget https://raw.githubusercontent.com/ali2000hos/startup-scripts/main/n8n/install-n8n.sh
+wget https://raw.githubusercontent.com/ali2000hos/startup-scripts/main/install-n8n.sh
 sudo bash install-n8n.sh
 ```
 
-Each directory has its own README with the full list of prompts and everything
-the script changes.
+Each script documents its own prompts and behavior in its header comment —
+open it before running.
 
 ## Design rules
 
