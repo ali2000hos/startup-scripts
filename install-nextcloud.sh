@@ -48,7 +48,7 @@ ask_yn() {
   done
 }
 
-trap 'log_error "Failed at line $LINENO. Nothing further was changed."' ERR
+trap 'log_error "Failed at line $LINENO. Re-run this script -- completed steps are preserved."' ERR
 
 # ------------------------------------------------------------------
 # Configuration
@@ -124,7 +124,7 @@ if [[ -f "$ENV_FILE" ]]; then
   echo "   It holds the database password, TURN secret and Talk signaling keys."
   echo "   Regenerating them would desync Nextcloud from what it already trusts."
   ask_yn "Keep the existing secrets and only update the configuration?" "y" \
-    || die "Aborted. To start over, remove ${ENV_FILE} first and re-run this script."
+    || die "Aborted. To start over completely, drop the PostgreSQL database/user too -- removing only ${ENV_FILE} leaves stale credentials in Postgres that the next run's new secrets won't match."
   set -a
   # shellcheck source=/dev/null
   . "$ENV_FILE"
@@ -380,9 +380,12 @@ TURN_SECRET="${TURN_SECRET:-$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | hea
 backup_config /etc/turnserver.conf
 cat > /etc/turnserver.conf <<TURNEOF
 listening-port=3478
-tls-listening-port=5349
+no-tls
+no-dtls
 listening-ip=0.0.0.0
 relay-ip=0.0.0.0
+min-port=49160
+max-port=49360
 fingerprint
 lt-cred-mech
 use-auth-secret
@@ -521,12 +524,12 @@ if command -v ufw &>/dev/null; then
   ufw allow 443/tcp  >/dev/null
   ufw allow 3478/tcp >/dev/null
   ufw allow 3478/udp >/dev/null
-  ufw allow 5349/tcp >/dev/null
+  ufw allow 49160:49360/udp >/dev/null   # coturn relay range, must match /etc/turnserver.conf min-port/max-port
   ufw --force enable >/dev/null
   ufw reload >/dev/null
   # Port 8081 (the signaling backend) is proxied through Apache and only
   # listens on 127.0.0.1 -- it must not be reachable from the internet.
-  log_success "UFW: SSH ${SSH_PORT}, 80, 443, 3478, 5349 open. Signaling backend stays loopback-only."
+  log_success "UFW: SSH ${SSH_PORT}, 80, 443, 3478, and TURN relay range 49160-49360/udp open. Signaling backend stays loopback-only."
 else
   log_warn "UFW not found -- skipping firewall config."
 fi
@@ -673,7 +676,7 @@ $OCC config:system:set server_id --value="$(hostname)"                   2>/dev/
 
 # -- TURN server ----------------------------------------------
 $OCC config:app:set spreed stun_servers --value="[{\"schemes\":\"stun:\",\"server\":\"${NC_DOMAIN}:3478\"}]"       2>/dev/null || true
-$OCC config:app:set spreed turn_servers --value="[{\"schemes\":\"turn:turns:\",\"server\":\"${NC_DOMAIN}:3478\",\"secret\":\"${TURN_SECRET}\",\"protocols\":\"udp,tcp\"}]" 2>/dev/null || true
+$OCC config:app:set spreed turn_servers --value="[{\"schemes\":\"turn\",\"server\":\"${NC_DOMAIN}:3478\",\"secret\":\"${TURN_SECRET}\",\"protocols\":\"udp,tcp\"}]" 2>/dev/null || true
 
 # -- Calendar -------------------------------------------------
 $OCC config:app:set dav sendEventRemindersMode --value=occ               2>/dev/null || true
