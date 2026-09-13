@@ -231,7 +231,9 @@ log_step "Step 3: PHP 8.3 via Sury repository"
 # ============================================================
 UBUNTU_CODENAME=$(lsb_release -sc)
 
-if [[ -f /etc/apt/sources.list.d/php.list ]] || \
+if apt-cache show php8.3-fpm 2>/dev/null | grep -q '^Version:'; then
+  log_success "PHP 8.3 is available directly from Ubuntu's own archive -- no external repo needed."
+elif [[ -f /etc/apt/sources.list.d/php.list ]] || \
    grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
   log_success "PHP repository already configured."
 elif [[ -f /usr/share/keyrings/deb.sury.org-php.gpg ]] || \
