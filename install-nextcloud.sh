@@ -230,7 +230,8 @@ log_success "Base packages installed."
 log_step "Step 3: PHP 8.3 via Sury repository"
 # ============================================================
 if [[ ! -f /usr/share/keyrings/deb.sury.org-php.gpg ]]; then
-  curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg \
+  curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+    -o /usr/share/keyrings/deb.sury.org-php.gpg \
     https://packages.sury.org/php/apt.gpg
 fi
 echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
