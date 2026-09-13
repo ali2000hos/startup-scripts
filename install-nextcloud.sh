@@ -229,14 +229,21 @@ log_success "Base packages installed."
 # ============================================================
 log_step "Step 3: PHP 8.3 via Sury repository"
 # ============================================================
-if [[ ! -f /usr/share/keyrings/deb.sury.org-php.gpg ]]; then
-  curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-delay 2 \
-    -o /usr/share/keyrings/deb.sury.org-php.gpg \
-    https://packages.sury.org/php/apt.gpg
+if [[ -f /etc/apt/sources.list.d/php.list ]] || \
+   grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
+  log_success "PHP repository already configured."
+elif [[ -f /usr/share/keyrings/deb.sury.org-php.gpg ]] || \
+     curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+       -o /usr/share/keyrings/deb.sury.org-php.gpg \
+       https://packages.sury.org/php/apt.gpg; then
+  echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
+    https://packages.sury.org/php/ $(lsb_release -sc) main" \
+    > /etc/apt/sources.list.d/php.list
+else
+  log_warn "packages.sury.org unreachable -- falling back to the ppa:ondrej/php mirror on Launchpad."
+  rm -f /usr/share/keyrings/deb.sury.org-php.gpg
+  add-apt-repository -y ppa:ondrej/php
 fi
-echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
-  https://packages.sury.org/php/ $(lsb_release -sc) main" \
-  > /etc/apt/sources.list.d/php.list
 
 apt-get update -qq
 apt-get install -y -qq \
