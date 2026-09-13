@@ -229,6 +229,8 @@ log_success "Base packages installed."
 # ============================================================
 log_step "Step 3: PHP 8.3 via Sury repository"
 # ============================================================
+UBUNTU_CODENAME=$(lsb_release -sc)
+
 if [[ -f /etc/apt/sources.list.d/php.list ]] || \
    grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
   log_success "PHP repository already configured."
@@ -237,12 +239,14 @@ elif [[ -f /usr/share/keyrings/deb.sury.org-php.gpg ]] || \
        -o /usr/share/keyrings/deb.sury.org-php.gpg \
        https://packages.sury.org/php/apt.gpg; then
   echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
-    https://packages.sury.org/php/ $(lsb_release -sc) main" \
+    https://packages.sury.org/php/ ${UBUNTU_CODENAME} main" \
     > /etc/apt/sources.list.d/php.list
-else
+elif [[ "$UBUNTU_CODENAME" == "jammy" || "$UBUNTU_CODENAME" == "noble" ]]; then
   log_warn "packages.sury.org unreachable -- falling back to the ppa:ondrej/php mirror on Launchpad."
   rm -f /usr/share/keyrings/deb.sury.org-php.gpg
   add-apt-repository -y ppa:ondrej/php
+else
+  die "Could not reach packages.sury.org, and the ppa:ondrej/php fallback does not yet support ${UBUNTU_CODENAME}. Check network/DNS access to packages.sury.org (try: curl -4 -v https://packages.sury.org/php/apt.gpg) and re-run."
 fi
 
 apt-get update -qq
