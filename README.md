@@ -17,6 +17,7 @@ the fixes for those specific failures.
 |---|---|
 | [`bootstrap-server.sh`](bootstrap-server.sh) | Updates, sudo user, key-only SSH, UFW, fail2ban, automatic security patches, swap, kernel hardening |
 | [`install-n8n.sh`](install-n8n.sh) | n8n with PostgreSQL, task runner, Nginx + Let's Encrypt, verified backups, safe updates |
+| [`install-nextcloud.sh`](install-nextcloud.sh) | Nextcloud with PHP 8.3, Apache, PostgreSQL, Redis, Talk (coturn + HPB), Let's Encrypt, backups, safe updates |
 
 On a new machine, run `bootstrap-server.sh` first, then whichever service you need.
 
@@ -33,6 +34,9 @@ sudo ssh-confirm
 # 3. Install a service
 wget https://raw.githubusercontent.com/ali2000hos/startup-scripts/main/install-n8n.sh
 sudo bash install-n8n.sh
+# ...or:
+wget https://raw.githubusercontent.com/ali2000hos/startup-scripts/main/install-nextcloud.sh
+sudo bash install-nextcloud.sh
 ```
 
 Each script documents its own prompts and behavior in its header comment —
