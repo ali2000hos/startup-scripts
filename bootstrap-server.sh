@@ -318,13 +318,13 @@ if $CREATE_USER; then
   else
     adduser --disabled-password --gecos "" "$ADMIN_USER" >/dev/null
     log_success "User ${ADMIN_USER} created."
-    if ! $DISABLE_PW; then
-      if ask_yn "Set a password for ${ADMIN_USER} now?" "y"; then
-        passwd "$ADMIN_USER" || log_warn "Password not set — run 'sudo passwd ${ADMIN_USER}' later."
-      else
-        log_warn "No password set — ${ADMIN_USER} can't log in with a password yet. Run 'sudo passwd ${ADMIN_USER}' later."
-      fi
-    fi
+  fi
+
+  # sudo needs a real local password on the account regardless of whether
+  # SSH password login is disabled — those are separate credential systems.
+  if [[ "$(passwd -S "$ADMIN_USER" | awk '{print $2}')" != "P" ]]; then
+    log_warn "${ADMIN_USER} has no usable password — sudo would reject every attempt."
+    passwd "$ADMIN_USER" || log_warn "Password not set — run 'sudo passwd ${ADMIN_USER}' before you log out."
   fi
 
   usermod -aG sudo "$ADMIN_USER"
@@ -391,6 +391,13 @@ ufw status numbered | sed 's/^/        /'
 log_step "Step 8: SSH hardening"
 # ------------------------------------------------------------------
 if $HARDEN_SSH; then
+  if $DISABLE_ROOT && $CREATE_USER; then
+    KEY_COUNT=$(grep -cE '^(ssh-|ecdsa-)' "${AUTH_FILE:-/dev/null}" 2>/dev/null || true)
+    if [[ "$(passwd -S "$ADMIN_USER" | awk '{print $2}')" != "P" ]] || (( KEY_COUNT == 0 )); then
+      die "Refusing to disable root SSH login: ${ADMIN_USER} lacks a usable sudo password or an authorized key. Fix Step 6 first."
+    fi
+  fi
+
   # A dropin from an earlier run means SSH is already hardened. Re-backing-up
   # /etc/ssh now would capture the hardened config, not the original — and
   # rewriting ssh-rollback below would make the safety net "restore" the
