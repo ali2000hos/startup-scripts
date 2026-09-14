@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.2.0
+# install-nextcloud.sh -- version: 1.3.0
 #
 # Nextcloud installer for a fresh Ubuntu server. Provisions everything up
 # front (PHP 8.3-8.5 auto-detected, Apache, PostgreSQL, Redis, coturn, a
@@ -139,6 +139,9 @@ log_step "Step 0.5: Configuration"
 # Detected early: coturn (Step 6) needs SERVER_IP before Step 9 used to set it.
 SERVER_IP=$(curl -4 -sf --max-time 10 ifconfig.me 2>/dev/null \
   || curl -4 -sf --max-time 10 api.ipify.org 2>/dev/null \
+  || curl -4 -sf --max-time 5 icanhazip.com 2>/dev/null \
+  || curl -4 -sf --max-time 5 checkip.amazonaws.com 2>/dev/null \
+  || curl -4 -sf --max-time 5 ident.me 2>/dev/null \
   || hostname -I | awk '{print $1}')
 # -sf treats HTTP errors (e.g. a 403 page) as failure so the fallback chain
 # above runs; still validate the result in case a service returns 200 with junk.
@@ -669,7 +672,48 @@ else
 </IfModule>
 SSLEOF
   a2ensite nextcloud-le-ssl
-  log_warn "Using self-signed certificate. Run certbot manually later."
+  log_warn "Using self-signed certificate -- a watcher will retry Let's Encrypt every 15 minutes."
+
+  cat > "${PROJECT_DIR}/ssl-auto-upgrade.sh" <<SSLUPEOF
+#!/bin/bash
+# Retries Let's Encrypt until it succeeds, then swaps the self-signed cert
+# for the real one and removes itself from cron.
+set -eo pipefail
+NC_DOMAIN="${NC_DOMAIN}"
+NCWWW_DIR="${NCWWW_DIR}"
+SSL_CONF="/etc/apache2/sites-available/nextcloud-le-ssl.conf"
+LOG_FILE="${LOG_DIR}/ssl.log"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+if ! grep -q "/etc/ssl/nextcloud/cert.pem" "\$SSL_CONF" 2>/dev/null; then
+  # Already on a real certificate -- nothing to do, stop retrying.
+  rm -f /etc/cron.d/nextcloud-ssl-upgrade
+  exit 0
+fi
+
+echo "[\$(ts)] Self-signed still active. Retrying Let's Encrypt for \${NC_DOMAIN}..." >> "\$LOG_FILE"
+if certbot certonly --webroot -w "\$NCWWW_DIR" -d "\$NC_DOMAIN" \\
+    --agree-tos --non-interactive --register-unsafely-without-email >> "\$LOG_FILE" 2>&1; then
+  LE_FULL="/etc/letsencrypt/live/\${NC_DOMAIN}/fullchain.pem"
+  LE_KEY="/etc/letsencrypt/live/\${NC_DOMAIN}/privkey.pem"
+  if [[ -f "\$LE_FULL" && -f "\$LE_KEY" ]]; then
+    sed -i "s|SSLCertificateFile .*|SSLCertificateFile \${LE_FULL}|" "\$SSL_CONF"
+    sed -i "s|SSLCertificateKeyFile .*|SSLCertificateKeyFile \${LE_KEY}|" "\$SSL_CONF"
+    systemctl reload apache2
+    echo "[\$(ts)] SUCCESS: switched to Let's Encrypt." >> "\$LOG_FILE"
+    rm -f /etc/cron.d/nextcloud-ssl-upgrade
+  fi
+else
+  echo "[\$(ts)] Still failing -- will retry in 15 minutes." >> "\$LOG_FILE"
+fi
+SSLUPEOF
+  chmod +x "${PROJECT_DIR}/ssl-auto-upgrade.sh"
+
+  cat > /etc/cron.d/nextcloud-ssl-upgrade <<CRONEOF
+*/15 * * * * root ${PROJECT_DIR}/ssl-auto-upgrade.sh
+CRONEOF
+  chmod 644 /etc/cron.d/nextcloud-ssl-upgrade
+  log_success "SSL auto-upgrade watcher scheduled (every 15 min, self-destructs on success)."
 fi
 
 # Certbot creates a separate SSL vhost (nextcloud-le-ssl.conf).
