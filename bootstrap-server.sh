@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# bootstrap-server.sh -- version: 1.0.0
 #
 # Interactive first-boot setup for a fresh Ubuntu server.
 # Updates, a sudo user with key-only SSH, firewall, fail2ban, automatic

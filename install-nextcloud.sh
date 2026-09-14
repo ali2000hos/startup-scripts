@@ -1,4 +1,14 @@
 #!/bin/bash
+# install-nextcloud.sh -- version: 2.0.0
+#
+# Non-interactive Nextcloud installer for a fresh Ubuntu server.
+# PHP 8.3 + Apache + PostgreSQL + Redis, coturn (Talk TURN), a high-performance
+# backend (Talk signaling), Docker stack (Imaginary, Elasticsearch, Whiteboard,
+# Talk Recording, Euro-Office, HaRP), Let's Encrypt TLS, optional S3 primary
+# storage, backups and safe updates.
+#
+# Usage:  sudo bash install-nextcloud.sh
+# Re-running is safe: existing secrets, data and the installed site are preserved.
 set -eo pipefail
 
 

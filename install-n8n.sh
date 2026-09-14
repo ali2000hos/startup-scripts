@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# install-n8n.sh -- version: 1.0.0
 #
 # Interactive n8n installer for a fresh Ubuntu server.
 # Docker + PostgreSQL 16 + task runner (+ optional queue mode with Redis & worker)
