@@ -183,6 +183,29 @@ done
 
 GENERIC_TIMEZONE=$(ask "Timezone for logs and calendar reminders" "${DETECTED_TZ:-${GENERIC_TIMEZONE:-UTC}}")
 
+DEFAULT_PHONE_REGION=$(ask "Default phone region (ISO 3166-1 country code, e.g. IR, US, DE)" "${DEFAULT_PHONE_REGION:-IR}")
+DEFAULT_PHONE_REGION="${DEFAULT_PHONE_REGION^^}"
+
+# --- Primary storage -------------------------------------------------
+echo ""
+echo "  Primary storage must be decided now -- switching to S3 later means"
+echo "  wiping the instance and starting over, there is no supported migration."
+S3_BUCKET="${S3_BUCKET:-}"
+if [[ -n "$S3_BUCKET" ]]; then
+  log_warn "S3 primary storage already configured (bucket: ${S3_BUCKET}) -- keeping it."
+elif ask_yn "Use S3-compatible object storage as primary storage (instead of local disk)?" "n"; then
+  S3_HOSTNAME=$(ask "S3 endpoint hostname (e.g. s3.us-west-1.wasabisys.com)" "${S3_HOSTNAME:-}")
+  S3_BUCKET=$(ask "S3 bucket name (must already exist)" "${S3_BUCKET:-}")
+  S3_KEY=$(ask "S3 access key" "${S3_KEY:-}")
+  S3_SECRET=$(ask "S3 secret key" "${S3_SECRET:-}")
+  S3_PORT=$(ask "S3 port" "${S3_PORT:-443}")
+  S3_REGION=$(ask "S3 region" "${S3_REGION:-us-east-1}")
+  S3_USE_SSL=$(ask_yn "Use SSL for the S3 connection?" "y" && echo true || echo false)
+  S3_USE_PATH_STYLE=$(ask_yn "Use path-style S3 URLs? (needed by most non-AWS providers)" "y" && echo true || echo false)
+  [[ -n "$S3_HOSTNAME" && -n "$S3_BUCKET" && -n "$S3_KEY" && -n "$S3_SECRET" ]] \
+    || die "S3 hostname, bucket, key and secret are all required for S3 primary storage."
+fi
+
 # Detect what a previous, possibly interrupted, run already had configured,
 # so a re-run defaults to preserving it rather than to the first-run default.
 BACKUP_DEFAULT="y"; AUTOUPDATE_DEFAULT="n"; PREV_RETAIN_DAYS="7"
@@ -207,7 +230,13 @@ echo -e "${BOLD}Summary${NC}"
 echo "  Domain:         https://${NC_DOMAIN}"
 echo "  Certificate:    Let's Encrypt${LETSENCRYPT_EMAIL:+ (notices to ${LETSENCRYPT_EMAIL})}"
 echo "  Timezone:       ${GENERIC_TIMEZONE}"
+echo "  Phone region:   ${DEFAULT_PHONE_REGION}"
 echo "  Database:       PostgreSQL (local, not exposed publicly)"
+echo "  Storage:        $([[ -n "$S3_BUCKET" ]] && echo "S3 (bucket: ${S3_BUCKET})" || echo "local disk (${NCDATA_DIR})")"
+if [[ -n "$S3_BUCKET" ]]; then
+  echo "                  NOTE: BorgBackup only protects the DB + config, not bucket contents."
+  echo "                  Bucket durability/versioning is your S3 provider's responsibility."
+fi
 echo "  Backups:        $($BACKUP_ENABLED && echo "nightly 02:00, ${BACKUP_RETAIN_DAYS} day retention" || echo 'manual only')"
 echo "  Auto-update:    $($AUTOUPDATE_ENABLED && echo 'daily 03:00' || echo 'manual only')"
 echo "  Install path:   ${PROJECT_DIR}"
@@ -636,6 +665,15 @@ log_step "Step 13: Save credentials & write autoconfig.php"
   echo "SIGNALING_BLOCKKEY=${SIGNALING_BLOCKKEY:-}"
   echo "INTERNAL_SECRET=${INTERNAL_SECRET:-}"
   echo "HPB_METHOD=${HPB_METHOD:-}"
+  echo "DEFAULT_PHONE_REGION=${DEFAULT_PHONE_REGION:-IR}"
+  echo "S3_HOSTNAME=${S3_HOSTNAME:-}"
+  echo "S3_BUCKET=${S3_BUCKET:-}"
+  echo "S3_KEY=${S3_KEY:-}"
+  echo "S3_SECRET=${S3_SECRET:-}"
+  echo "S3_PORT=${S3_PORT:-443}"
+  echo "S3_REGION=${S3_REGION:-us-east-1}"
+  echo "S3_USE_SSL=${S3_USE_SSL:-true}"
+  echo "S3_USE_PATH_STYLE=${S3_USE_PATH_STYLE:-true}"
 } > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 log_success "Credentials saved to ${ENV_FILE}"
@@ -646,7 +684,47 @@ log_success "Credentials saved to ${ENV_FILE}"
 if [[ ! -f "${NCWWW_DIR}/config/config.php" ]] || \
    ! grep -q "'dbtype'" "${NCWWW_DIR}/config/config.php"; then
   rm -f "${NCWWW_DIR}/config/config.php"
-  cat > "${NCWWW_DIR}/config/autoconfig.php" <<AUTOCONFIGEOF
+  if [[ -n "${S3_BUCKET:-}" ]]; then
+    # objectstore can only be set via config.php, not autoconfig.php -- write
+    # the db credentials directly into config.php so the wizard skips the DB
+    # screen (it detects an existing 'dbtype') and only asks for admin creds.
+    INSTANCEID="oc$(openssl rand -hex 6)"
+    PASSWORDSALT=$(openssl rand -hex 24)
+    SECRET=$(openssl rand -hex 24)
+    cat > "${NCWWW_DIR}/config/config.php" <<CONFIGEOF
+<?php
+\$CONFIG = [
+  'instanceid'    => '${INSTANCEID}',
+  'passwordsalt'  => '${PASSWORDSALT}',
+  'secret'        => '${SECRET}',
+  'dbtype'        => 'pgsql',
+  'dbname'        => '${NC_DB}',
+  'dbuser'        => '${NC_DB_USER}',
+  'dbpassword'    => '${NC_DB_PASS}',
+  'dbhost'        => '127.0.0.1',
+  'dbtableprefix' => 'oc_',
+  'datadirectory' => '${NCDATA_DIR}',
+  'objectstore'   => [
+    'class'     => '\\OC\\Files\\ObjectStore\\S3',
+    'arguments' => [
+      'bucket'         => '${S3_BUCKET}',
+      'key'            => '${S3_KEY}',
+      'secret'         => '${S3_SECRET}',
+      'hostname'       => '${S3_HOSTNAME}',
+      'port'           => ${S3_PORT:-443},
+      'use_ssl'        => ${S3_USE_SSL:-true},
+      'use_path_style' => ${S3_USE_PATH_STYLE:-true},
+      'region'         => '${S3_REGION:-us-east-1}',
+      'autocreate'     => false,
+    ],
+  ],
+];
+CONFIGEOF
+    chown www-data:www-data "${NCWWW_DIR}/config/config.php"
+    chmod 640 "${NCWWW_DIR}/config/config.php"
+    log_success "config.php written with S3 primary storage -- wizard will only ask for admin credentials."
+  else
+    cat > "${NCWWW_DIR}/config/autoconfig.php" <<AUTOCONFIGEOF
 <?php
 \$AUTOCONFIG = [
     'dbtype'        => 'pgsql',
@@ -658,9 +736,10 @@ if [[ ! -f "${NCWWW_DIR}/config/config.php" ]] || \
     'directory'     => '${NCDATA_DIR}',
 ];
 AUTOCONFIGEOF
-  chown www-data:www-data "${NCWWW_DIR}/config/autoconfig.php"
-  chmod 640 "${NCWWW_DIR}/config/autoconfig.php"
-  log_success "autoconfig.php written -- wizard will pre-fill database fields."
+    chown www-data:www-data "${NCWWW_DIR}/config/autoconfig.php"
+    chmod 640 "${NCWWW_DIR}/config/autoconfig.php"
+    log_success "autoconfig.php written -- wizard will pre-fill database fields."
+  fi
 fi
 
 # ============================================================
@@ -717,6 +796,7 @@ $OCC maintenance:update:htaccess                                          2>/dev
 $OCC config:system:set appconfig files max_chunk_size --value="0"        2>/dev/null || true
 $OCC config:system:set maintenance_window_start --type=integer --value=2  2>/dev/null || true
 $OCC config:system:set server_id --value="$(hostname)"                   2>/dev/null || true
+$OCC config:system:set default_phone_region --value="${DEFAULT_PHONE_REGION:-IR}" 2>/dev/null || true
 
 # -- TURN server ----------------------------------------------
 $OCC config:app:set spreed stun_servers --value="[{\"schemes\":\"stun:\",\"server\":\"${NC_DOMAIN}:3478\"}]"       2>/dev/null || true
@@ -1306,6 +1386,7 @@ echo -e "  Cache:            ${CYAN}Redis (socket or TCP) + APCu${NC}"
 echo -e "  Push:             ${CYAN}notify_push (arch: $(uname -m))${NC}"
 echo -e "  TURN:             ${CYAN}coturn :3478 TCP/UDP${NC}"
 echo -e "  HPB (Talk):       ${CYAN}${HPB_METHOD:-unknown} method${NC}"
+echo -e "  Storage:          ${CYAN}$([[ -n "${S3_BUCKET:-}" ]] && echo "S3 (bucket: ${S3_BUCKET})" || echo "local disk")${NC}"
 echo -e "  Backup:           ${CYAN}BorgBackup ($($BACKUP_ENABLED && echo "nightly 02:00, ${BACKUP_RETAIN_DAYS}d retention" || echo disabled))${NC}"
 echo -e "  Auto-update:      ${CYAN}$($AUTOUPDATE_ENABLED && echo 'daily 03:00' || echo disabled)${NC}"
 echo ""
