@@ -184,6 +184,18 @@ echo ""
 INSTALL_FAIL2BAN=true
 ask_yn "Install fail2ban (bans repeated failed logins)?" "y" || INSTALL_FAIL2BAN=false
 
+ADMIN_IPS=""
+if $INSTALL_FAIL2BAN; then
+  # Auto-detect the IP of whoever is running this script over SSH, so a few
+  # fumbled logins while testing a new key/port can't lock the admin out.
+  DETECTED_ADMIN_IP=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
+  echo ""
+  echo "  fail2ban bans an IP after 8 failed SSH attempts in 10 min for 15 min --"
+  echo "  loose enough that a few mistyped ports/users/keys while testing won't lock you out."
+  echo "  If you have a static IP, whitelisting it removes the risk entirely."
+  ADMIN_IPS=$(ask "Your IP(s) to whitelist in fail2ban, comma separated (blank if not static/skip)" "${DETECTED_ADMIN_IP}")
+fi
+
 AUTO_UPDATES=true
 ask_yn "Enable automatic security updates?" "y" || AUTO_UPDATES=false
 AUTO_REBOOT=false
@@ -501,6 +513,10 @@ fi
 log_step "Step 9: fail2ban"
 # ------------------------------------------------------------------
 if $INSTALL_FAIL2BAN; then
+  IGNORE_IPS="127.0.0.1/8 ::1"
+  if [[ -n "$ADMIN_IPS" ]]; then
+    IGNORE_IPS="${IGNORE_IPS} ${ADMIN_IPS//,/ }"
+  fi
   cat > /etc/fail2ban/jail.local <<F2BEOF
 [DEFAULT]
 bantime  = 1h
@@ -508,16 +524,19 @@ findtime = 10m
 maxretry = 5
 backend  = systemd
 destemail = root@localhost
+ignoreip = ${IGNORE_IPS}
 
 [sshd]
 enabled = true
 port    = ${NEW_SSH_PORT}
-maxretry = 4
-bantime  = 2h
+maxretry = 8
+findtime = 10m
+bantime  = 15m
 F2BEOF
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
   systemctl restart fail2ban
-  log_success "fail2ban active (4 tries, 2 hour ban on SSH)."
+  log_success "fail2ban active (8 tries / 10 min, 15 min ban on SSH)."
+  [[ -n "$ADMIN_IPS" ]] && log_success "Whitelisted from bans: ${ADMIN_IPS}"
 else
   log_info "fail2ban skipped."
 fi
@@ -604,6 +623,7 @@ Admin user:     $($CREATE_USER && echo "${ADMIN_USER}" || echo 'none created')
 Password login: $($DISABLE_PW && echo 'disabled' || echo 'enabled')
 Root SSH:       $($DISABLE_ROOT && echo 'disabled' || echo 'enabled')
 fail2ban:       $($INSTALL_FAIL2BAN && echo active || echo 'not installed')
+Whitelisted IPs: ${ADMIN_IPS:-none}
 Auto updates:   $($AUTO_UPDATES && echo enabled || echo disabled)
 Config backups: ${BACKUP_ROOT}
 SUMEOF
