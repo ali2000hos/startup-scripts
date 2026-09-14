@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.4.0
+# install-nextcloud.sh -- version: 1.5.0
 #
 # Nextcloud installer for a fresh Ubuntu server. Provisions everything up
 # front (PHP 8.3-8.5 auto-detected, Apache, PostgreSQL, Redis, coturn, a
@@ -1125,32 +1125,47 @@ OCC="sudo -u www-data php ${NCWWW_DIR}/occ"
 # Once a real install exists (dbtype present), never touch it again on a
 # re-run -- overwriting instanceid/secret/passwordsalt would lock everyone
 # out of a live instance.
+# Nextcloud's setup wizard (core/Controller/SetupController.php) only ever
+# reads config/autoconfig.php to pre-fill the browser DB-setup form -- it
+# never looks at config.php for that purpose. So DB creds always go through
+# autoconfig.php. S3 needs the 'objectstore' key, which autoconfig.php has
+# no schema for; that key alone is written straight into config.php instead.
+# Nextcloud's config writer merges into existing keys rather than replacing
+# the file, so 'objectstore' survives install() untouched and becomes the
+# primary storage from the very first file the installer writes -- setting
+# it *after* install would leave the admin's initial skeleton files stuck on
+# local disk instead of S3.
 if $OCC status 2>/dev/null | grep -q "installed: true"; then
   log_warn "Nextcloud already installed -- skipping config prefill."
-elif [[ ! -f "${NCWWW_DIR}/config/config.php" ]] || ! grep -q "'dbtype'" "${NCWWW_DIR}/config/config.php"; then
+else
+  # Not installed yet -- always (re)write the prefill files. This also covers
+  # the LE HTTP-01-challenge stub (a bare config.php with just an instanceid)
+  # and any stale config.php left by an earlier incomplete attempt: neither
+  # has 'installed' => true, so it's safe to overwrite before a real install
+  # exists.
   rm -f "${NCWWW_DIR}/config/config.php"
   mkdir -p "${NCWWW_DIR}/config"
+  cat > "${NCWWW_DIR}/config/autoconfig.php" <<AUTOCONFIGEOF
+<?php
+\$AUTOCONFIG = [
+    'dbtype'        => 'pgsql',
+    'dbname'        => '${NC_DB}',
+    'dbuser'        => '${NC_DB_USER}',
+    'dbpass'        => '${NC_DB_PASS}',
+    'dbhost'        => '127.0.0.1',
+    'dbtableprefix' => 'oc_',
+    'directory'     => '${NCDATA_DIR}',
+];
+AUTOCONFIGEOF
+  chown www-data:www-data "${NCWWW_DIR}/config/autoconfig.php"
+  chmod 640 "${NCWWW_DIR}/config/autoconfig.php"
+  log_success "autoconfig.php written -- wizard will pre-fill database fields."
+
   if [[ -n "${S3_BUCKET:-}" ]]; then
-    # objectstore can only be set via config.php, not autoconfig.php -- write
-    # the db credentials directly into config.php so the wizard detects an
-    # existing 'dbtype' and skips straight to the admin-account screen.
-    INSTANCEID="oc$(openssl rand -hex 6)"
-    PASSWORDSALT=$(openssl rand -hex 24)
-    SECRET=$(openssl rand -hex 24)
     cat > "${NCWWW_DIR}/config/config.php" <<CONFIGEOF
 <?php
 \$CONFIG = [
-  'instanceid'    => '${INSTANCEID}',
-  'passwordsalt'  => '${PASSWORDSALT}',
-  'secret'        => '${SECRET}',
-  'dbtype'        => 'pgsql',
-  'dbname'        => '${NC_DB}',
-  'dbuser'        => '${NC_DB_USER}',
-  'dbpassword'    => '${NC_DB_PASS}',
-  'dbhost'        => '127.0.0.1',
-  'dbtableprefix' => 'oc_',
-  'datadirectory' => '${NCDATA_DIR}',
-  'objectstore'   => [
+  'objectstore' => [
     'class'     => '\\OC\\Files\\ObjectStore\\S3',
     'arguments' => [
       'bucket'         => '${S3_BUCKET}',
@@ -1168,26 +1183,8 @@ elif [[ ! -f "${NCWWW_DIR}/config/config.php" ]] || ! grep -q "'dbtype'" "${NCWW
 CONFIGEOF
     chown www-data:www-data "${NCWWW_DIR}/config/config.php"
     chmod 640 "${NCWWW_DIR}/config/config.php"
-    log_success "config.php pre-filled (DB + S3) -- wizard will only ask for admin credentials."
-  else
-    cat > "${NCWWW_DIR}/config/autoconfig.php" <<AUTOCONFIGEOF
-<?php
-\$AUTOCONFIG = [
-    'dbtype'        => 'pgsql',
-    'dbname'        => '${NC_DB}',
-    'dbuser'        => '${NC_DB_USER}',
-    'dbpass'        => '${NC_DB_PASS}',
-    'dbhost'        => '127.0.0.1',
-    'dbtableprefix' => 'oc_',
-    'directory'     => '${NCDATA_DIR}',
-];
-AUTOCONFIGEOF
-    chown www-data:www-data "${NCWWW_DIR}/config/autoconfig.php"
-    chmod 640 "${NCWWW_DIR}/config/autoconfig.php"
-    log_success "autoconfig.php written -- wizard will pre-fill database fields."
+    log_success "S3 objectstore pre-set in config.php."
   fi
-else
-  log_warn "config.php already has a real install -- leaving it untouched."
 fi
 
 # ============================================================
