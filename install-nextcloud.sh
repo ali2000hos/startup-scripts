@@ -640,7 +640,12 @@ log_step "Step 13: Save credentials & write autoconfig.php"
 chmod 600 "$ENV_FILE"
 log_success "Credentials saved to ${ENV_FILE}"
 
-if [[ ! -f "${NCWWW_DIR}/config/config.php" ]]; then
+# Let's Encrypt's HTTP-01 challenge in Step 12 already hit the site once,
+# which makes Nextcloud auto-write a bare config.php (just an instanceid,
+# no dbtype) before install. Treat that stub the same as "no config.php".
+if [[ ! -f "${NCWWW_DIR}/config/config.php" ]] || \
+   ! grep -q "'dbtype'" "${NCWWW_DIR}/config/config.php"; then
+  rm -f "${NCWWW_DIR}/config/config.php"
   cat > "${NCWWW_DIR}/config/autoconfig.php" <<AUTOCONFIGEOF
 <?php
 \$AUTOCONFIG = [
