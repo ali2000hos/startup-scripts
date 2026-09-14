@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.0.3
+# install-nextcloud.sh -- version: 1.0.4
 #
 # Non-interactive Nextcloud installer for a fresh Ubuntu server.
 # PHP 8.3-8.5 (auto-detected) + Apache + PostgreSQL + Redis, coturn (Talk TURN), a high-performance
@@ -28,11 +28,41 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 die()         { log_error "$1"; exit 1; }
 log_step()    { echo -e "\n${BOLD}${CYAN}== $1 ==${NC}"; }
 
+ask() {
+  local prompt="$1" default="${2:-}" answer
+  if [[ -n "$default" ]]; then
+    read -rp "$(echo -e "${BOLD}?${NC} ${prompt} [${CYAN}${default}${NC}]: ")" answer
+    echo "${answer:-$default}"
+  else
+    read -rp "$(echo -e "${BOLD}?${NC} ${prompt}: ")" answer
+    echo "$answer"
+  fi
+}
+
+ask_yn() {
+  local prompt="$1" default="${2:-n}" answer hint
+  [[ "$default" == "y" ]] && hint="Y/n" || hint="y/N"
+  while true; do
+    read -rp "$(echo -e "${BOLD}?${NC} ${prompt} (${hint}): ")" answer
+    answer="${answer:-$default}"
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      *)     echo "   Please answer y or n." ;;
+    esac
+  done
+}
+
 # -- Guard: root ----------------------------------------------
 if [[ $EUID -ne 0 ]]; then
   log_error "This script must be run as root: sudo bash $0"
   exit 1
 fi
+
+# -- Guard: interactive terminal --------------------------------
+# Step 0.5 below prompts for domain/phone-region/S3 -- piping this
+# script straight from curl leaves no stdin for those to read.
+[[ -t 0 ]] || die "This script is interactive. Download it first, then run it -- do not pipe it from curl."
 
 # -- Guard: Ubuntu only ---------------------------------------
 OS_ID=$(grep '^ID=' /etc/os-release | cut -d= -f2)
@@ -64,35 +94,41 @@ DETECTED_TZ=$(cat /etc/timezone 2>/dev/null \
 SECONDS=0
 elapsed() { printf "%dm %ds" "$((SECONDS/60))" "$((SECONDS%60))"; }
 
+BACKUP_ROOT="${PROJECT_DIR}/config-backups"
+# Back up a config file before it gets overwritten, so a re-run never
+# silently destroys a hand-edited config.
+backup_config() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  mkdir -p "$BACKUP_ROOT"
+  cp -a "$f" "${BACKUP_ROOT}/$(basename "$f").$(date +%Y%m%d%H%M%S).bak"
+}
+
 mkdir -p "${PROJECT_DIR}" "${BACKUP_DIR}" "${LOG_DIR}"
+chmod 700 "${BACKUP_DIR}"
+
+# -- Resources: memory / swap / disk ---------------------------
+TOTAL_MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+log_info "Memory: ${TOTAL_MEM_MB} MB"
+if (( TOTAL_MEM_MB < 4000 )); then
+  log_warn "Nextcloud + Talk's signaling stack + the Docker services (Elasticsearch, etc.) want ~4-6 GB RAM. You have ${TOTAL_MEM_MB} MB."
+  if [[ ! -f /swapfile ]] && ask_yn "Create a 2 GB swap file to be safe?" "y"; then
+    fallocate -l 2G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    log_success "2 GB swap enabled."
+  fi
+fi
+
+FREE_GB=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+(( FREE_GB >= 10 )) || log_warn "Only ${FREE_GB} GB free on /. Nextcloud, its data, the Docker images and backups need headroom."
 
 # -- Reuse settings from a previous run (idempotent re-runs) ---
 [[ -f "${PROJECT_DIR}/.env" ]] && source "${PROJECT_DIR}/.env"
 
-ask() {
-  local prompt="$1" default="${2:-}" answer
-  if [[ -n "$default" ]]; then
-    read -rp "$(echo -e "${BOLD}?${NC} ${prompt} [${CYAN}${default}${NC}]: ")" answer
-    echo "${answer:-$default}"
-  else
-    read -rp "$(echo -e "${BOLD}?${NC} ${prompt}: ")" answer
-    echo "$answer"
-  fi
-}
-
-ask_yn() {
-  local prompt="$1" default="${2:-n}" answer hint
-  [[ "$default" == "y" ]] && hint="Y/n" || hint="y/N"
-  while true; do
-    read -rp "$(echo -e "${BOLD}?${NC} ${prompt} (${hint}): ")" answer
-    answer="${answer:-$default}"
-    case "${answer,,}" in
-      y|yes) return 0 ;;
-      n|no)  return 1 ;;
-      *)     echo "   Please answer y or n." ;;
-    esac
-  done
-}
+trap 'log_error "Failed at line $LINENO. Re-run this script -- completed steps are preserved."' ERR
 
 # ============================================================
 log_step "Step 0.5: Configuration"
@@ -327,6 +363,7 @@ log_step "Step 5: Redis (unix socket with TCP fallback)"
 apt-get install -y -qq redis-server
 
 REDIS_CONF="/etc/redis/redis.conf"
+backup_config "$REDIS_CONF"
 sed -i 's/^# maxmemory <bytes>/maxmemory 256mb/'           "$REDIS_CONF"
 sed -i 's/^# maxmemory-policy.*/maxmemory-policy allkeys-lru/' "$REDIS_CONF"
 sed -i 's|^# unixsocket .*|unixsocket /run/redis/redis.sock|' "$REDIS_CONF"
@@ -370,14 +407,18 @@ log_step "Step 6: coturn (TURN server for Talk)"
 # ============================================================
 apt-get install -y -qq coturn
 
-TURN_SECRET=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32)
+TURN_SECRET="${TURN_SECRET:-$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32)}"
 
+backup_config /etc/turnserver.conf
 cat > /etc/turnserver.conf <<TURNEOF
 listening-port=3478
-tls-listening-port=5349
+no-tls
+no-dtls
 listening-ip=0.0.0.0
 relay-ip=0.0.0.0
 external-ip=${SERVER_IP}
+min-port=49160
+max-port=49360
 fingerprint
 lt-cred-mech
 use-auth-secret
@@ -475,6 +516,7 @@ log_success "Nextcloud deployed to ${NCWWW_DIR}."
 # ============================================================
 log_step "Step 11: Apache virtual host (HTTP -- pre-SSL)"
 # ============================================================
+backup_config /etc/apache2/sites-available/nextcloud.conf
 cat > /etc/apache2/sites-available/nextcloud.conf <<APACHEEOF
 <VirtualHost *:80>
     ServerName ${NC_DOMAIN}
@@ -575,11 +617,11 @@ if command -v ufw &>/dev/null; then
   ufw allow 443/tcp  2>/dev/null || true
   ufw allow 3478/tcp 2>/dev/null || true
   ufw allow 3478/udp 2>/dev/null || true
-  ufw allow 5349/tcp 2>/dev/null || true
+  ufw allow 49160:49360/udp 2>/dev/null || true   # coturn relay range, must match /etc/turnserver.conf min-port/max-port
   # Internal services (HPB, HaRP) are bound to 127.0.0.1 — no public access needed
   ufw --force enable
   ufw reload
-  log_success "UFW: ports 22, 80, 443, 3478, 5349 open (8081/HPB stays loopback-only, reached via Apache proxy)."
+  log_success "UFW: ports 22, 80, 443, 3478, and TURN relay range 49160-49360/udp open (8081/HPB stays loopback-only, reached via Apache proxy)."
 else
   log_warn "UFW not found -- skipping firewall config."
 fi
@@ -743,6 +785,8 @@ INTERNAL_SECRET=${INTERNAL_SECRET}
 HARP_SHARED_KEY=${HARP_SHARED_KEY}
 BORG_PASSPHRASE=${BORG_PASSPHRASE}
 SIGNALING_SECRET=${SIGNALING_SECRET}
+SIGNALING_HASHKEY=${SIGNALING_HASHKEY:-}
+SIGNALING_BLOCKKEY=${SIGNALING_BLOCKKEY:-}
 DOCKERSECEOF
 chmod 600 "${PROJECT_DIR}/.env"
 log_success "Docker service secrets generated."
@@ -1131,11 +1175,14 @@ $OCC config:system:set appconfig files max_chunk_size --value="0"        2>/dev/
 $OCC config:system:set maintenance_window_start --type=integer --value=2  2>/dev/null || true
 $OCC config:system:set server_id --value="$(hostname)"                   2>/dev/null || true
 
-# -- TURN server ----------------------------------------------
+# -- TURN server ------------------------------------------------
+# coturn above runs with no-tls/no-dtls, so only the plain "turn" scheme
+# works -- advertising "turns" here would just give clients a relay that
+# never connects since no cert is wired to coturn's TLS listener.
 $OCC config:app:set spreed stun_servers \
-  --value="[{\"server\":\"stun.l.google.com:19302\",\"schemes\":\"stun:\"}]" 2>/dev/null || true
-$OCC config:app:set spreed turn_servers --value="[]" 2>/dev/null || true
-$OCC config:app:set spreed turn_secret --value="${TURN_SECRET}" 2>/dev/null || true
+  --value="[{\"schemes\":\"stun:\",\"server\":\"${NC_DOMAIN}:3478\"}]" 2>/dev/null || true
+$OCC config:app:set spreed turn_servers \
+  --value="[{\"schemes\":\"turn\",\"server\":\"${NC_DOMAIN}:3478\",\"secret\":\"${TURN_SECRET}\",\"protocols\":\"udp,tcp\"}]" 2>/dev/null || true
 
 # -- Calendar & notifications ---------------------------------
 $OCC config:app:set dav sendEventRemindersMode --value=occ               2>/dev/null || true
@@ -1434,9 +1481,10 @@ if apt-get install -y -qq nextcloud-spreed-signaling morph027-keyring; then
   # The package ships a heavily-commented template; patching it with sed is
   # fragile because comment formats vary between versions. Writing the full
   # minimal config avoids duplicate-section problems entirely.
-  SIGNALING_HASHKEY=$(openssl rand -hex 32)
-  SIGNALING_BLOCKKEY=$(python3 -c "import secrets; print(secrets.token_hex(16))")
+  SIGNALING_HASHKEY="${SIGNALING_HASHKEY:-$(openssl rand -hex 32)}"
+  SIGNALING_BLOCKKEY="${SIGNALING_BLOCKKEY:-$(python3 -c "import secrets; print(secrets.token_hex(16))")}"
 
+  backup_config /etc/signaling/server.conf
   # Write server.conf via python3 to guarantee a clean single-instance config.
   python3 - <<PYEOF2
 import os, tempfile
@@ -1529,6 +1577,7 @@ services:
     restart: unless-stopped
 COMPOSEEOF
 
+  backup_config config/server.conf
   cat > config/server.conf <<SIGCONF
 [http]
 listen = 127.0.0.1:8081
