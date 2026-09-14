@@ -25,6 +25,7 @@ log_success() { echo -e "${GREEN}[OK]${NC}    $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_info()    { echo -e "${CYAN}[INFO]${NC}  $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
+die()         { log_error "$1"; exit 1; }
 log_step()    { echo -e "\n${BOLD}${CYAN}== $1 ==${NC}"; }
 
 # -- Guard: root ----------------------------------------------
@@ -97,9 +98,14 @@ ask_yn() {
 log_step "Step 0.5: Configuration"
 # ============================================================
 # Detected early: coturn (Step 6) needs SERVER_IP before Step 9 used to set it.
-SERVER_IP=$(curl -s --max-time 10 ifconfig.me 2>/dev/null \
-  || curl -s --max-time 10 api.ipify.org 2>/dev/null \
+SERVER_IP=$(curl -4 -sf --max-time 10 ifconfig.me 2>/dev/null \
+  || curl -4 -sf --max-time 10 api.ipify.org 2>/dev/null \
   || hostname -I | awk '{print $1}')
+# -sf treats HTTP errors (e.g. a 403 page) as failure so the fallback chain
+# above runs; still validate the result in case a service returns 200 with junk.
+if ! [[ "$SERVER_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+  SERVER_IP=$(hostname -I | awk '{print $1}')
+fi
 DOMAIN_IP=$(echo "${SERVER_IP}" | tr '.' '-')
 SUBDOMAIN_PREFIX="${SUBDOMAIN_PREFIX:-cloud}"
 
@@ -150,14 +156,27 @@ log_success "Base packages installed."
 # ============================================================
 log_step "Step 2: PHP 8.3 via Sury repository"
 # ============================================================
-# Always use Sury for a consistent PHP 8.3 across all Ubuntu versions.
-if [ ! -f /usr/share/keyrings/deb.sury.org-php.gpg ]; then
-  curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg \
-    https://packages.sury.org/php/apt.gpg
+UBUNTU_CODENAME=$(lsb_release -sc)
+
+if apt-cache show php8.3-fpm 2>/dev/null | grep -q '^Version:'; then
+  log_success "PHP 8.3 is available directly from Ubuntu's own archive -- no external repo needed."
+elif [[ -f /etc/apt/sources.list.d/php.list ]] || \
+     grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
+  log_success "PHP repository already configured."
+elif [[ -f /usr/share/keyrings/deb.sury.org-php.gpg ]] || \
+     curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+       -o /usr/share/keyrings/deb.sury.org-php.gpg \
+       https://packages.sury.org/php/apt.gpg; then
+  echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
+    https://packages.sury.org/php/ ${UBUNTU_CODENAME} main" \
+    > /etc/apt/sources.list.d/php.list
+elif [[ "$UBUNTU_CODENAME" == "jammy" || "$UBUNTU_CODENAME" == "noble" ]]; then
+  log_warn "packages.sury.org unreachable -- falling back to the ppa:ondrej/php mirror on Launchpad."
+  rm -f /usr/share/keyrings/deb.sury.org-php.gpg
+  add-apt-repository -y ppa:ondrej/php
+else
+  die "Could not reach packages.sury.org, and the ppa:ondrej/php fallback does not yet support ${UBUNTU_CODENAME}. Check network/DNS access to packages.sury.org (try: curl -4 -v https://packages.sury.org/php/apt.gpg) and re-run."
 fi
-echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
-  https://packages.sury.org/php/ $(lsb_release -sc) main" \
-  > /etc/apt/sources.list.d/php.list
 
 apt-get update -qq
 apt-get install -y -qq \
