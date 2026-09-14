@@ -1,11 +1,14 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.0.4
+# install-nextcloud.sh -- version: 1.1.0
 #
-# Non-interactive Nextcloud installer for a fresh Ubuntu server.
-# PHP 8.3-8.5 (auto-detected) + Apache + PostgreSQL + Redis, coturn (Talk TURN), a high-performance
-# backend (Talk signaling), Docker stack (Imaginary, Elasticsearch, Whiteboard,
-# Talk Recording, Euro-Office, HaRP), Let's Encrypt TLS, optional S3 primary
-# storage, backups and safe updates.
+# Nextcloud installer for a fresh Ubuntu server. Provisions everything up
+# front (PHP 8.3-8.5 auto-detected, Apache, PostgreSQL, Redis, coturn, a
+# high-performance Talk signaling backend, Docker stack -- Imaginary,
+# Elasticsearch, Whiteboard, Talk Recording, Euro-Office, HaRP -- Let's
+# Encrypt TLS, backups) then pre-fills the DB (and S3, if configured) so you
+# finish setup by hand in the browser via Nextcloud's own wizard, choosing
+# your own admin username/password. Apps and remaining config finish
+# installing automatically in the background once the wizard completes.
 #
 # Usage:  sudo bash install-nextcloud.sh
 # Re-running is safe: existing secrets, data and the installed site are preserved.
@@ -728,17 +731,12 @@ systemctl reload apache2
 # ============================================================
 log_step "Step 14: Generate credentials"
 # ============================================================
-# Reuse from a previous run if present -- regenerating would desync
-# from the admin password already stored in the Nextcloud database.
-NC_ADMIN_USER="${NC_ADMIN_USER:-ncadmin-$(openssl rand -hex 4)}"
-NC_ADMIN_PASS="${NC_ADMIN_PASS:-$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#%^&*' | head -c 24)}"
-
+# No admin credentials are generated here -- the user picks their own
+# username and password in the web setup wizard.
 cat > "${PROJECT_DIR}/.env" <<ENVEOF
 # Nextcloud Install Secrets -- chmod 600
 NC_DOMAIN=${NC_DOMAIN}
 SERVER_IP=${SERVER_IP}
-NC_ADMIN_USER=${NC_ADMIN_USER}
-NC_ADMIN_PASS=${NC_ADMIN_PASS}
 NC_DB=${NC_DB}
 NC_DB_USER=${NC_DB_USER}
 NC_DB_PASS=${NC_DB_PASS}
@@ -757,8 +755,7 @@ S3_USE_SSL=${S3_USE_SSL:-}
 S3_USE_PATH_STYLE=${S3_USE_PATH_STYLE:-}
 ENVEOF
 chmod 600 "${PROJECT_DIR}/.env"
-log_success "Admin credentials generated."
-log_info "Username: ${NC_ADMIN_USER}"
+log_success "Core credentials generated."
 
 # -- Docker service secrets (generated upfront for one-click install) -
 DOCKER_DIR="/opt/nextcloud-docker"
@@ -1099,23 +1096,46 @@ if [ "${HEALTHY}" -lt 3 ]; then
 fi
 
 # ============================================================
-log_step "Step 16: Install Nextcloud via occ"
+log_step "Step 16: Prepare Nextcloud for web-based setup"
 # ============================================================
 OCC="sudo -u www-data php ${NCWWW_DIR}/occ"
 
-log_info "Running Nextcloud CLI install..."
+# No occ maintenance:install / admin creds here -- the wizard runs in the
+# browser so the user picks their own admin username and password. DB (and
+# S3, if configured) are pre-filled here so the wizard only asks for that.
+#
+# Let's Encrypt's HTTP-01 challenge in Step 13 already hit the site once,
+# which makes Nextcloud auto-write a bare config.php (just an instanceid,
+# no dbtype) before install. Treat that stub the same as "no config.php".
+# Once a real install exists (dbtype present), never touch it again on a
+# re-run -- overwriting instanceid/secret/passwordsalt would lock everyone
+# out of a live instance.
 if $OCC status 2>/dev/null | grep -q "installed: true"; then
-  log_warn "Nextcloud already installed -- skipping."
-else
+  log_warn "Nextcloud already installed -- skipping config prefill."
+elif [[ ! -f "${NCWWW_DIR}/config/config.php" ]] || ! grep -q "'dbtype'" "${NCWWW_DIR}/config/config.php"; then
+  rm -f "${NCWWW_DIR}/config/config.php"
+  mkdir -p "${NCWWW_DIR}/config"
   if [[ -n "${S3_BUCKET:-}" ]]; then
-    # maintenance:install merges dbtype/instanceid/passwordsalt/secret into
-    # this file rather than overwriting it, so pre-seeding just objectstore
-    # here is enough -- and safer than letting the S3 keys ever touch argv.
-    mkdir -p "${NCWWW_DIR}/config"
+    # objectstore can only be set via config.php, not autoconfig.php -- write
+    # the db credentials directly into config.php so the wizard detects an
+    # existing 'dbtype' and skips straight to the admin-account screen.
+    INSTANCEID="oc$(openssl rand -hex 6)"
+    PASSWORDSALT=$(openssl rand -hex 24)
+    SECRET=$(openssl rand -hex 24)
     cat > "${NCWWW_DIR}/config/config.php" <<CONFIGEOF
 <?php
 \$CONFIG = [
-  'objectstore' => [
+  'instanceid'    => '${INSTANCEID}',
+  'passwordsalt'  => '${PASSWORDSALT}',
+  'secret'        => '${SECRET}',
+  'dbtype'        => 'pgsql',
+  'dbname'        => '${NC_DB}',
+  'dbuser'        => '${NC_DB_USER}',
+  'dbpassword'    => '${NC_DB_PASS}',
+  'dbhost'        => '127.0.0.1',
+  'dbtableprefix' => 'oc_',
+  'datadirectory' => '${NCDATA_DIR}',
+  'objectstore'   => [
     'class'     => '\\OC\\Files\\ObjectStore\\S3',
     'arguments' => [
       'bucket'         => '${S3_BUCKET}',
@@ -1133,19 +1153,61 @@ else
 CONFIGEOF
     chown www-data:www-data "${NCWWW_DIR}/config/config.php"
     chmod 640 "${NCWWW_DIR}/config/config.php"
-    log_success "S3 primary storage pre-configured (bucket: ${S3_BUCKET})."
+    log_success "config.php pre-filled (DB + S3) -- wizard will only ask for admin credentials."
+  else
+    cat > "${NCWWW_DIR}/config/autoconfig.php" <<AUTOCONFIGEOF
+<?php
+\$AUTOCONFIG = [
+    'dbtype'        => 'pgsql',
+    'dbname'        => '${NC_DB}',
+    'dbuser'        => '${NC_DB_USER}',
+    'dbpass'        => '${NC_DB_PASS}',
+    'dbhost'        => '127.0.0.1',
+    'dbtableprefix' => 'oc_',
+    'directory'     => '${NCDATA_DIR}',
+];
+AUTOCONFIGEOF
+    chown www-data:www-data "${NCWWW_DIR}/config/autoconfig.php"
+    chmod 640 "${NCWWW_DIR}/config/autoconfig.php"
+    log_success "autoconfig.php written -- wizard will pre-fill database fields."
   fi
-  $OCC maintenance:install \
-    --database      "pgsql" \
-    --database-host "127.0.0.1" \
-    --database-name "${NC_DB}" \
-    --database-user "${NC_DB_USER}" \
-    --database-pass "${NC_DB_PASS}" \
-    --admin-user    "${NC_ADMIN_USER}" \
-    --admin-pass    "${NC_ADMIN_PASS}" \
-    --data-dir      "${NCDATA_DIR}" 2>&1
-  log_success "Nextcloud core installed."
+else
+  log_warn "config.php already has a real install -- leaving it untouched."
 fi
+
+# ============================================================
+log_step "Step 16.5: Register post-setup automation"
+# ============================================================
+# Everything below needs a working Nextcloud DB (config:system:set, app
+# installs, etc.), which doesn't exist until the user finishes the wizard
+# in the browser. Defer it all to a script triggered by a polling cron.
+cat > "${PROJECT_DIR}/post-setup.sh" <<'POSTEOF'
+#!/bin/bash
+# post-setup.sh -- finishes configuring Nextcloud after the user completes
+# the web setup wizard. Triggered by /etc/cron.d/nextcloud-post-setup
+# polling for "installed: true"; self-destructs when done.
+set -uo pipefail
+
+NCWWW_DIR="/var/www/nextcloud"
+LOG_DIR="/var/log/nextcloud"
+PROJECT_DIR="/opt/nextcloud"
+LOG_FILE="${LOG_DIR}/post-setup.log"
+OCC="sudo -u www-data php ${NCWWW_DIR}/occ"
+DONE_MARKER="${PROJECT_DIR}/.post-setup-done"
+
+exec 9>/var/lock/nc-post-setup.lock
+flock -n 9 || exit 0
+[[ -f "${DONE_MARKER}" ]] && exit 0
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}"; }
+
+log "===================================="
+log "Post-setup started."
+
+set -a
+# shellcheck source=/dev/null
+source "${PROJECT_DIR}/.env"
+set +a
 
 # -- Trusted domain & URLs ------------------------------------
 $OCC config:system:set trusted_domains 0 --value="${NC_DOMAIN}"           2>/dev/null || true
@@ -1161,7 +1223,7 @@ $OCC config:system:set memcache.local       --value='\OC\Memcache\APCu'  2>/dev/
 $OCC config:system:set memcache.locking     --value='\OC\Memcache\Redis' 2>/dev/null || true
 $OCC config:system:set memcache.distributed --value='\OC\Memcache\Redis' 2>/dev/null || true
 $OCC config:system:set redis host           --value="${REDIS_HOST}"          2>/dev/null || true
-$OCC config:system:set redis port           --value=${REDIS_PORT} --type=integer 2>/dev/null || true
+$OCC config:system:set redis port           --value="${REDIS_PORT}" --type=integer 2>/dev/null || true
 
 # -- General system settings ----------------------------------
 $OCC config:system:set logtimezone           --value="${DETECTED_TZ}"    2>/dev/null || true
@@ -1176,9 +1238,9 @@ $OCC config:system:set maintenance_window_start --type=integer --value=2  2>/dev
 $OCC config:system:set server_id --value="$(hostname)"                   2>/dev/null || true
 
 # -- TURN server ------------------------------------------------
-# coturn above runs with no-tls/no-dtls, so only the plain "turn" scheme
-# works -- advertising "turns" here would just give clients a relay that
-# never connects since no cert is wired to coturn's TLS listener.
+# coturn runs with no-tls/no-dtls, so only the plain "turn" scheme works --
+# advertising "turns" here would give clients a relay that never connects
+# since no cert is wired to coturn's TLS listener.
 $OCC config:app:set spreed stun_servers \
   --value="[{\"schemes\":\"stun:\",\"server\":\"${NC_DOMAIN}:3478\"}]" 2>/dev/null || true
 $OCC config:app:set spreed turn_servers \
@@ -1190,21 +1252,19 @@ $OCC config:app:set dav sendEventRemindersPush --value=1                 2>/dev/
 $OCC config:app:set admin_notifications push_to_talk --value=1           2>/dev/null || true
 $OCC config:app:set spreed signaling_dev --value=0                       2>/dev/null || true
 
-log_success "System configs applied."
+log "System configs applied."
 
 # -- Install apps ---------------------------------------------
 install_app() {
   local APP_ID="$1"
   local DISPLAY_NAME="$2"
-  log_info "Installing: ${DISPLAY_NAME}"
-  if $OCC app:install "${APP_ID}" --no-interaction >> "${LOG_DIR}/app-install.log" 2>&1; then
-    log_success "  [ok] ${DISPLAY_NAME}"
+  log "Installing: ${DISPLAY_NAME}"
+  if $OCC app:install "${APP_ID}" --no-interaction >> "${LOG_FILE}" 2>&1; then
+    log "  [ok] ${DISPLAY_NAME}"
+  elif $OCC app:enable "${APP_ID}" >> "${LOG_FILE}" 2>&1; then
+    log "  [ok] ${DISPLAY_NAME} enabled."
   else
-    if $OCC app:enable "${APP_ID}" >> "${LOG_DIR}/app-install.log" 2>&1; then
-      log_success "  [ok] ${DISPLAY_NAME} enabled."
-    else
-      log_warn "  [!!] ${DISPLAY_NAME} could not be installed."
-    fi
+    log "  [!!] ${DISPLAY_NAME} could not be installed."
   fi
 }
 
@@ -1212,18 +1272,18 @@ install_app "spreed"               "Nextcloud Talk"
 install_app "calendar"             "Nextcloud Calendar"
 install_app "contacts"             "Nextcloud Contacts"
 install_app "mail"                 "Nextcloud Mail"
-install_app "eurooffice" "Nextcloud Office (Euro-Office)"
+install_app "eurooffice"           "Nextcloud Office (Euro-Office)"
 install_app "assistant"            "Nextcloud Assistant"
 install_app "flow_notifications"   "Nextcloud Flow"
 install_app "deck"                 "Nextcloud Deck"
 install_app "notify_push"          "Push Notification"
 install_app "twofactor_totp"       "Two-Factor TOTP"
 
-$OCC app:enable files_external                   >> "${LOG_DIR}/app-install.log" 2>&1 || true
-$OCC app:enable twofactor_nextcloud_notification >> "${LOG_DIR}/app-install.log" 2>&1 || true
-$OCC app:disable firstrunwizard                  >> "${LOG_DIR}/app-install.log" 2>&1 || true
+$OCC app:enable files_external                   >> "${LOG_FILE}" 2>&1 || true
+$OCC app:enable twofactor_nextcloud_notification >> "${LOG_FILE}" 2>&1 || true
+$OCC app:disable firstrunwizard                  >> "${LOG_FILE}" 2>&1 || true
 
-log_success "All apps installed."
+log "Apps installed."
 
 # -- notify_push daemon ---------------------------------------
 ARCH=$(uname -m)
@@ -1258,23 +1318,21 @@ PUSHEOF
   systemctl daemon-reload
   systemctl enable --now notify_push
   sleep 5
-  if $OCC notify_push:setup "https://${NC_DOMAIN}/push" >> "${LOG_DIR}/notify_push.log" 2>&1; then
-    log_success "notify_push configured."
+  if $OCC notify_push:setup "https://${NC_DOMAIN}/push" >> "${LOG_FILE}" 2>&1; then
+    log "notify_push configured."
     systemctl restart notify_push
     sleep 3
-    $OCC notify_push:self-test >> "${LOG_DIR}/notify_push.log" 2>&1 && \
-      log_success "notify_push self-test passed." || \
-      log_warn "notify_push self-test had issues."
+    $OCC notify_push:self-test >> "${LOG_FILE}" 2>&1 && log "notify_push self-test passed." || log "notify_push self-test had issues."
   else
-    log_warn "notify_push setup failed -- run manually after install."
+    log "notify_push setup failed -- run manually."
   fi
 fi
 
-# -- Configure Docker services in Nextcloud -------------------
+# -- Docker service integrations --------------------------------
 # Imaginary
-log_info "Waiting for Imaginary..."
+log "Waiting for Imaginary..."
 for i in $(seq 1 12); do
-  if curl -sf http://127.0.0.1:9000/health 2>/dev/null | grep -q "uptime\|OK"; then break; fi
+  curl -sf http://127.0.0.1:9000/health 2>/dev/null | grep -q "uptime\|OK" && break
   sleep 5
 done
 if curl -s http://127.0.0.1:9000/health 2>/dev/null | grep -q "uptime\|OK"; then
@@ -1282,83 +1340,79 @@ if curl -s http://127.0.0.1:9000/health 2>/dev/null | grep -q "uptime\|OK"; then
   $OCC config:system:set preview_imaginary_url    --value="http://127.0.0.1:9000"       2>/dev/null || true
   $OCC config:system:set preview_max_x --value="2048" --type=integer                   2>/dev/null || true
   $OCC config:system:set preview_max_y --value="2048" --type=integer                   2>/dev/null || true
-  log_success "Imaginary configured for previews."
+  log "Imaginary configured for previews."
 fi
 
 # Elasticsearch
-log_info "Waiting for Elasticsearch..."
+log "Waiting for Elasticsearch..."
 for i in $(seq 1 30); do
-  if curl -sf -u "elastic:${ELASTIC_PASSWORD}" http://127.0.0.1:9200/_cluster/health 2>/dev/null | grep -q "green\|yellow"; then break; fi
+  curl -sf -u "elastic:${ELASTIC_PASSWORD}" http://127.0.0.1:9200/_cluster/health 2>/dev/null | grep -q "green\|yellow" && break
   sleep 5
 done
 if curl -s -u "elastic:${ELASTIC_PASSWORD}" http://127.0.0.1:9200/_cluster/health 2>/dev/null | grep -q "green\|yellow"; then
-  $OCC app:install fulltextsearch               >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable fulltextsearch 2>/dev/null || true
-  $OCC app:install fulltextsearch_elasticsearch >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable fulltextsearch_elasticsearch 2>/dev/null || true
-  $OCC app:install files_fulltextsearch         >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable files_fulltextsearch 2>/dev/null || true
+  $OCC app:install fulltextsearch               >> "${LOG_FILE}" 2>&1 || $OCC app:enable fulltextsearch 2>/dev/null || true
+  $OCC app:install fulltextsearch_elasticsearch >> "${LOG_FILE}" 2>&1 || $OCC app:enable fulltextsearch_elasticsearch 2>/dev/null || true
+  $OCC app:install files_fulltextsearch         >> "${LOG_FILE}" 2>&1 || $OCC app:enable files_fulltextsearch 2>/dev/null || true
   echo '{"search_platform":"OCA\\FullTextSearch_Elasticsearch\\Platform\\ElasticSearchPlatform"}' | \
     $OCC fulltextsearch:configure \
-    >> "${LOG_DIR}/app-install.log" 2>&1 || true
+    >> "${LOG_FILE}" 2>&1 || true
   $OCC config:app:set fulltextsearch_elasticsearch elastic_host \
     --value="http://elastic:${ELASTIC_PASSWORD}@127.0.0.1:9200" \
-    >> "${LOG_DIR}/app-install.log" 2>&1 || true
+    >> "${LOG_FILE}" 2>&1 || true
   $OCC config:app:set fulltextsearch_elasticsearch elastic_index \
     --value="nextcloud" \
-    >> "${LOG_DIR}/app-install.log" 2>&1 || true
+    >> "${LOG_FILE}" 2>&1 || true
   $OCC config:app:set fulltextsearch_elasticsearch elastic_user \
     --value="elastic" \
-    >> "${LOG_DIR}/app-install.log" 2>&1 || true
+    >> "${LOG_FILE}" 2>&1 || true
   $OCC config:app:set fulltextsearch_elasticsearch elastic_password \
     --value="${ELASTIC_PASSWORD}" \
-    >> "${LOG_DIR}/app-install.log" 2>&1 || true
-  log_success "Elasticsearch Full Text Search configured."
+    >> "${LOG_FILE}" 2>&1 || true
+  log "Elasticsearch Full Text Search configured."
 fi
 
 # Whiteboard
-log_info "Waiting for Whiteboard..."
+log "Waiting for Whiteboard..."
 for i in $(seq 1 12); do
-  if curl -sf http://127.0.0.1:3002/ 2>/dev/null | grep -qi "whiteboard"; then break; fi
+  curl -sf http://127.0.0.1:3002/ 2>/dev/null | grep -qi "whiteboard" && break
   sleep 5
 done
 if curl -s http://127.0.0.1:3002/ 2>/dev/null | grep -qi "whiteboard"; then
-  $OCC app:install whiteboard >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable whiteboard 2>/dev/null || true
+  $OCC app:install whiteboard >> "${LOG_FILE}" 2>&1 || $OCC app:enable whiteboard 2>/dev/null || true
   $OCC config:app:set whiteboard collabBackendUrl --value="https://${NC_DOMAIN}" 2>/dev/null || true
   $OCC config:app:set whiteboard jwt_secret_key   --value="${WHITEBOARD_SECRET}"             2>/dev/null || true
-  log_success "Whiteboard configured."
+  log "Whiteboard configured."
 fi
 
-# Memories (photo gallery & timeline)
-$OCC app:install memories >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable memories 2>/dev/null || true
+# Memories
+$OCC app:install memories >> "${LOG_FILE}" 2>&1 || $OCC app:enable memories 2>/dev/null || true
 
-# Preview Generator (pre-generate thumbnails)
-$OCC app:install previewgenerator >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable previewgenerator 2>/dev/null || true
+# Preview Generator
+$OCC app:install previewgenerator >> "${LOG_FILE}" 2>&1 || $OCC app:enable previewgenerator 2>/dev/null || true
 
 # Euro-Office Document Server
-log_info "Waiting for Euro-Office Document Server..."
+log "Waiting for Euro-Office Document Server..."
 for i in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:9980/healthcheck 2>/dev/null | grep -qi "true"; then
-    break
-  fi
+  curl -sf http://127.0.0.1:9980/healthcheck 2>/dev/null | grep -qi "true" && break
   sleep 5
 done
 if curl -sf http://127.0.0.1:9980/healthcheck 2>/dev/null | grep -qi "true"; then
-  $OCC app:install eurooffice >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable eurooffice 2>/dev/null || true
+  $OCC app:install eurooffice >> "${LOG_FILE}" 2>&1 || $OCC app:enable eurooffice 2>/dev/null || true
   $OCC config:app:set eurooffice DocumentServerUrl     --value="https://${NC_DOMAIN}/eurooffice/"             2>/dev/null || true
   $OCC config:app:set eurooffice DocumentServerInternalUrl --value="http://127.0.0.1:9980/"                   2>/dev/null || true
   $OCC config:app:set eurooffice storageUrl             --value="https://${NC_DOMAIN}"                        2>/dev/null || true
   $OCC config:app:set eurooffice jwt_secret            --value="${EUROOFFICE_JWT_SECRET}"                     2>/dev/null || true
   $OCC config:app:set eurooffice jwt_header            --value="AuthorizationJwt"                             2>/dev/null || true
   $OCC config:system:set allow_local_remote_servers   --value="true"                                         2>/dev/null || true
-  log_success "Euro-Office Document Server configured."
+  log "Euro-Office Document Server configured."
 else
-  log_warn "Euro-Office not responding on :9980 -- skipping config."
+  log "Euro-Office not responding on :9980 -- skipping config."
 fi
 
 # Talk Recording
-log_info "Waiting for Talk Recording server..."
+log "Waiting for Talk Recording server..."
 for i in $(seq 1 60); do
-  if curl -s http://127.0.0.1:1234/api/v1/welcome 2>/dev/null | grep -qi "version\|recording\|welcome"; then
-    break
-  fi
+  curl -s http://127.0.0.1:1234/api/v1/welcome 2>/dev/null | grep -qi "version\|recording\|welcome" && break
   sleep 5
 done
 if curl -s http://127.0.0.1:1234/api/v1/welcome 2>/dev/null | grep -qi "version\|recording\|welcome"; then
@@ -1366,21 +1420,19 @@ if curl -s http://127.0.0.1:1234/api/v1/welcome 2>/dev/null | grep -qi "version\
   $OCC config:app:set spreed recording_servers \
     --value="{\"servers\":[{\"server\":\"https://${NC_DOMAIN}/recording\",\"secret\":\"${RECORDING_SECRET}\",\"verify\":false}],\"secret\":\"${RECORDING_SECRET}\"}" \
     2>/dev/null || true
-  log_success "Talk Recording configured."
+  log "Talk Recording configured."
 else
-  log_warn "Talk Recording not responding on :1234 -- skipping config."
+  log "Talk Recording not responding on :1234 -- skipping config."
 fi
 
-# AppAPI (HaRP - recommended) or Docker Socket Proxy (fallback)
-log_info "Waiting for AppAPI/HaRP..."
+# AppAPI (HaRP or Docker Socket Proxy)
+log "Waiting for AppAPI/HaRP..."
 for i in $(seq 1 60); do
-  if curl -s http://127.0.0.1:8780/ 2>/dev/null | grep -qi "not found\|harp\|ok"; then
-    break
-  fi
+  curl -s http://127.0.0.1:8780/ 2>/dev/null | grep -qi "not found\|harp\|ok" && break
   sleep 5
 done
 if curl -s http://127.0.0.1:8780/ 2>/dev/null | grep -qi "not found\|harp\|ok"; then
-  $OCC app:install app_api >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable app_api 2>/dev/null || true
+  $OCC app:install app_api >> "${LOG_FILE}" 2>&1 || $OCC app:enable app_api 2>/dev/null || true
   $OCC app_api:daemon:register \
     --net=host \
     --set-default \
@@ -1389,16 +1441,56 @@ if curl -s http://127.0.0.1:8780/ 2>/dev/null | grep -qi "not found\|harp\|ok"; 
     --harp_shared_key "${HARP_SHARED_KEY}" \
     harp_local "HaRP Proxy (Host)" docker-install \
     http "127.0.0.1:8780" "https://${NC_DOMAIN}" 2>&1 || true
-  log_success "AppAPI configured with HaRP."
+  log "AppAPI configured with HaRP."
 elif curl -s http://127.0.0.1:2375/version 2>/dev/null | grep -q "ApiVersion\|Version"; then
-  $OCC app:install app_api >> "${LOG_DIR}/app-install.log" 2>&1 || $OCC app:enable app_api 2>/dev/null || true
+  $OCC app:install app_api >> "${LOG_FILE}" 2>&1 || $OCC app:enable app_api 2>/dev/null || true
   $OCC app_api:daemon:register \
     --net=host \
     --set-default \
     docker_local_sock "Docker Local (Socket Proxy)" docker-install \
     http "127.0.0.1:2375" "https://${NC_DOMAIN}" 2>&1 || true
-  log_success "AppAPI configured with Docker Socket Proxy (fallback)."
+  log "AppAPI configured with Docker Socket Proxy (fallback)."
 fi
+
+# -- HPB registration -------------------------------------------
+# Remove ALL existing entries before adding, avoiding the "multiple HPB"
+# deprecation warning on re-runs.
+if [[ -n "${SIGNALING_SECRET:-}" ]]; then
+  $OCC config:app:delete spreed signaling_servers 2>/dev/null || true
+  sleep 1
+  if $OCC talk:signaling:add \
+    "wss://${NC_DOMAIN}/standalone-signaling" \
+    "${SIGNALING_SECRET}" >> "${LOG_FILE}" 2>&1; then
+    log "HPB registered in Nextcloud."
+  else
+    log "HPB registration failed -- fallback to config:set"
+    $OCC config:app:set spreed signaling_servers \
+      --value='[{"url":"https://'"${NC_DOMAIN}"'/standalone-signaling","secret":"'"${SIGNALING_SECRET}"'","verify":false}]' \
+      2>/dev/null || true
+  fi
+fi
+
+# -- Background jobs ------------------------------------------
+$OCC background:cron || true
+sudo -u www-data php "${NCWWW_DIR}/cron.php" 2>/dev/null || true
+
+# -- DB indices & repair ------------------------------------------
+$OCC db:add-missing-indices                 >> "${LOG_FILE}" 2>&1 || true
+$OCC maintenance:repair --include-expensive >> "${LOG_FILE}" 2>&1 || true
+$OCC maintenance:update:htaccess            >> "${LOG_FILE}" 2>&1 || true
+
+rm -f /etc/cron.d/nextcloud-post-setup
+touch "${DONE_MARKER}"
+log "Post-setup complete. Nextcloud is fully configured."
+log "===================================="
+POSTEOF
+chmod +x "${PROJECT_DIR}/post-setup.sh"
+
+cat > /etc/cron.d/nextcloud-post-setup <<'POSTCRONEOF'
+* * * * * root /bin/bash -c 'sudo -u www-data php /var/www/nextcloud/occ status 2>/dev/null | grep -q "installed: true" && bash /opt/nextcloud/post-setup.sh' || true
+POSTCRONEOF
+chmod 644 /etc/cron.d/nextcloud-post-setup
+log_success "post-setup.sh created -- will run automatically once you finish the wizard."
 
 # Apache proxy for Whiteboard WebSocket, Talk Recording, and HaRP ExApps
 for CONF in /etc/apache2/sites-available/nextcloud-le-ssl.conf \
@@ -1437,13 +1529,6 @@ else:
   fi
 done
 apache2ctl configtest >> "${LOG_DIR}/app-install.log" 2>&1 && systemctl reload apache2 || true
-
-# DB indices & repair
-$OCC db:add-missing-indices       >> "${LOG_DIR}/app-install.log" 2>&1 || true
-$OCC maintenance:repair --include-expensive >> "${LOG_DIR}/app-install.log" 2>&1 || true
-$OCC maintenance:update:htaccess  >> "${LOG_DIR}/app-install.log" 2>&1 || true
-
-log_success "Nextcloud install complete."
 
 # ============================================================
 log_step "Step 17: High-performance backend (HPB) for Talk"
@@ -1509,22 +1594,8 @@ PYEOF2
     || systemctl restart nextcloud-spreed-signaling 2>/dev/null
   sleep 5
 
-  # Register HPB in Nextcloud (APT branch).
-  # Use config:app:delete to remove ALL existing entries before adding,
-  # preventing the "multiple HPB" deprecation warning on re-runs.
-  log_info "Registering HPB in Nextcloud..."
-  $OCC config:app:delete spreed signaling_servers 2>/dev/null || true
-  sleep 1
-  if $OCC talk:signaling:add \
-    "wss://${NC_DOMAIN}/standalone-signaling" \
-    "${SIGNALING_SECRET}" >> "${LOG_DIR}/hpb.log" 2>&1; then
-    log_success "HPB registered in Nextcloud."
-  else
-    log_warn "HPB registration failed -- fallback to config:set"
-    $OCC config:app:set spreed signaling_servers \
-      --value='[{"url":"https://'"${NC_DOMAIN}"'/standalone-signaling","secret":"'"${SIGNALING_SECRET}"'","verify":false}]' \
-      2>/dev/null || true
-  fi
+  # Registering HPB in Nextcloud (talk:signaling:add) needs a working DB --
+  # deferred to post-setup.sh, which runs once the wizard is finished.
 
   sleep 3
   if curl -s -o /dev/null -w "%{http_code}" \
@@ -1608,20 +1679,8 @@ SIGCONF
   docker compose up -d
   sleep 10
 
-  # Register HPB in Nextcloud (Docker branch).
-  log_info "Registering HPB (Docker) in Nextcloud..."
-  $OCC config:app:delete spreed signaling_servers 2>/dev/null || true
-  sleep 1
-  if $OCC talk:signaling:add \
-    "wss://${NC_DOMAIN}/standalone-signaling" \
-    "${SIGNALING_SECRET}" >> "${LOG_DIR}/hpb.log" 2>&1; then
-    log_success "HPB (Docker) registered in Nextcloud."
-  else
-    log_warn "HPB registration failed -- fallback to config:set"
-    $OCC config:app:set spreed signaling_servers \
-      --value='[{"url":"https://'"${NC_DOMAIN}"'/standalone-signaling","secret":"'"${SIGNALING_SECRET}"'","verify":false}]' \
-      2>/dev/null || true
-  fi
+  # Registering HPB in Nextcloud (talk:signaling:add) needs a working DB --
+  # deferred to post-setup.sh, which runs once the wizard is finished.
 
   if curl -s -o /dev/null -w "%{http_code}" \
     http://127.0.0.1:8081/api/v1/welcome 2>/dev/null | grep -q "200"; then
@@ -1655,11 +1714,7 @@ log_step "Step 19: Cron jobs"
 echo "*/5 * * * * www-data php -f ${NCWWW_DIR}/cron.php > /dev/null 2>&1" \
   > /etc/cron.d/nextcloud
 chmod 644 /etc/cron.d/nextcloud
-$OCC background:cron || true
-
-# Force one immediate cron run so "last run" is populated.
-sudo -u www-data php "${NCWWW_DIR}/cron.php" 2>/dev/null || true
-log_success "Nextcloud cron configured and executed once."
+log_success "Nextcloud cron configured (background:cron runs once the wizard is finished)."
 
 # Calendar reminders -- separate job, every 5 minutes.
 echo "*/5 * * * * www-data php -f ${NCWWW_DIR}/occ dav:send-event-reminders > /dev/null 2>&1" \
@@ -1906,8 +1961,9 @@ log_success "Log rotation configured (14 days)."
 
 log_step "Step 22: Final service restart & checks"
 # ============================================================
-# Nextcloud is already fully installed and configured by Step 16
-# (occ maintenance:install, no web wizard). Just restart services.
+# DB/S3 fields are pre-filled (Step 16); the actual install and app/config
+# setup happens after the user finishes the browser wizard (post-setup.sh).
+# Just restart services here.
 
 systemctl restart redis-server 2>/dev/null || true
 systemctl restart "php${PHP_VER}-fpm" 2>/dev/null || true
@@ -1933,12 +1989,10 @@ TOTAL_TIME=$(elapsed)
 # ============================================================
 echo ""
 echo -e "${BOLD}${GREEN}============================================================${NC}"
-echo -e "${BOLD}${GREEN}|        Nextcloud is installed and running               |${NC}"
+echo -e "${BOLD}${GREEN}|        Nextcloud is ready for setup                     |${NC}"
 echo -e "${BOLD}${GREEN}============================================================${NC}"
 echo ""
 echo -e "  URL:              ${CYAN}https://${NC_DOMAIN}${NC}"
-echo -e "  Admin username:   ${CYAN}${NC_ADMIN_USER}${NC}"
-echo -e "  Admin password:   ${CYAN}${NC_ADMIN_PASS}${NC}"
 echo -e "  SSL:              ${CYAN}Let's Encrypt (auto-renew: twice daily)${NC}"
 echo -e "  Database:         ${CYAN}PostgreSQL -- ${NC_DB}${NC}"
 echo -e "  Timezone:         ${CYAN}${DETECTED_TZ}${NC}"
@@ -2012,4 +2066,12 @@ echo ""
 echo ""
 echo -e "${YELLOW}  [!]  Euro-Office Document Server is running on :9980${NC}"
 echo -e "${YELLOW}       First edit may take a few minutes as the container initializes.${NC}"
+echo ""
+echo -e "${BOLD}First-time setup:${NC}"
+echo -e "  1. Open ${CYAN}https://${NC_DOMAIN}${NC} in your browser."
+echo -e "  2. The setup wizard will appear -- database (and S3, if configured)"
+echo -e "     fields are pre-filled. Choose your own admin username/password."
+echo -e "  3. After you click 'Finish setup', apps and configs install"
+echo -e "     automatically in the background (1-3 minutes)."
+echo -e "     Monitor progress: ${CYAN}tail -f ${LOG_DIR}/post-setup.log${NC}"
 echo ""
