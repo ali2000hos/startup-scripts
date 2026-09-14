@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.5.0
+# install-nextcloud.sh -- version: 1.5.1
 #
 # Nextcloud installer for a fresh Ubuntu server. Provisions everything up
 # front (PHP 8.3-8.5 auto-detected, Apache, PostgreSQL, Redis, coturn, a
@@ -1701,14 +1701,16 @@ fi
 # ============================================================
 log_step "Step 19: Cron jobs"
 # ============================================================
-# Nextcloud background jobs -- every 5 minutes.
-echo "*/5 * * * * www-data php -f ${NCWWW_DIR}/cron.php > /dev/null 2>&1" \
+# Nextcloud background jobs -- every 5 minutes. Gated on "installed: true" so
+# cron.php doesn't spam the log with "Not installed" exceptions before the
+# user finishes the web setup wizard.
+echo "*/5 * * * * www-data /bin/bash -c 'php -f ${NCWWW_DIR}/occ status 2>/dev/null | grep -q \"installed: true\" && php -f ${NCWWW_DIR}/cron.php' > /dev/null 2>&1" \
   > /etc/cron.d/nextcloud
 chmod 644 /etc/cron.d/nextcloud
 log_success "Nextcloud cron configured (background:cron runs once the wizard is finished)."
 
-# Calendar reminders -- separate job, every 5 minutes.
-echo "*/5 * * * * www-data php -f ${NCWWW_DIR}/occ dav:send-event-reminders > /dev/null 2>&1" \
+# Calendar reminders -- separate job, every 5 minutes. Same install-gate.
+echo "*/5 * * * * www-data /bin/bash -c 'php -f ${NCWWW_DIR}/occ status 2>/dev/null | grep -q \"installed: true\" && php -f ${NCWWW_DIR}/occ dav:send-event-reminders' > /dev/null 2>&1" \
   > /etc/cron.d/nextcloud-calendar
 chmod 644 /etc/cron.d/nextcloud-calendar
 
