@@ -1,8 +1,8 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.0.2
+# install-nextcloud.sh -- version: 1.0.3
 #
 # Non-interactive Nextcloud installer for a fresh Ubuntu server.
-# PHP 8.3 + Apache + PostgreSQL + Redis, coturn (Talk TURN), a high-performance
+# PHP 8.3-8.5 (auto-detected) + Apache + PostgreSQL + Redis, coturn (Talk TURN), a high-performance
 # backend (Talk signaling), Docker stack (Imaginary, Elasticsearch, Whiteboard,
 # Talk Recording, Euro-Office, HaRP), Let's Encrypt TLS, optional S3 primary
 # storage, backups and safe updates.
@@ -154,18 +154,27 @@ apt-get install -y -qq \
 log_success "Base packages installed."
 
 # ============================================================
-log_step "Step 2: PHP 8.3 via Sury repository"
+log_step "Step 2: PHP (Ubuntu archive, or Sury/PPA fallback)"
 # ============================================================
 UBUNTU_CODENAME=$(lsb_release -sc)
 
-# php8.3-fpm lives in the "universe" component, which some minimal cloud
-# images ship disabled -- enable it before deciding an external repo is
-# needed, since Ubuntu 24.04+ already carries php8.3 in its own archive.
+# The various PHP packages live in the "universe" component, which some
+# minimal cloud images ship disabled -- enable it before deciding an
+# external repo is needed, since Ubuntu 24.04+ already carries a recent
+# PHP in its own archive.
 add-apt-repository -y universe >/dev/null 2>&1 || true
 apt-get update -qq
 
-if apt-cache show php8.3-fpm 2>/dev/null | grep -q '^Version:'; then
-  log_success "PHP 8.3 is available directly from Ubuntu's own archive -- no external repo needed."
+PHP_VER=""
+for v in 8.3 8.4 8.5; do
+  if apt-cache show "php${v}-fpm" 2>/dev/null | grep -q '^Version:'; then
+    PHP_VER="$v"
+    break
+  fi
+done
+
+if [[ -n "$PHP_VER" ]]; then
+  log_success "PHP ${PHP_VER} is available directly from Ubuntu's own archive -- no external repo needed."
 elif [[ -f /etc/apt/sources.list.d/php.list ]] || \
      grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
   log_success "PHP repository already configured."
@@ -184,18 +193,35 @@ else
   die "Could not reach packages.sury.org, and the ppa:ondrej/php fallback does not yet support ${UBUNTU_CODENAME}. Check network/DNS access to packages.sury.org (try: curl -4 -v https://packages.sury.org/php/apt.gpg) and re-run."
 fi
 
+PHP_VER="${PHP_VER:-8.3}"
+
 apt-get update -qq
 apt-get install -y -qq \
-  php8.3-fpm php8.3-cli \
-  php8.3-pgsql php8.3-gd php8.3-curl php8.3-xml \
-  php8.3-zip php8.3-mbstring php8.3-intl php8.3-bcmath \
-  php8.3-gmp php8.3-bz2 php8.3-imagick \
-  php8.3-redis php8.3-apcu php8.3-imap \
-  libapache2-mod-php8.3 \
-  php-pear php8.3-dev
+  "php${PHP_VER}-fpm" "php${PHP_VER}-cli" \
+  "php${PHP_VER}-pgsql" "php${PHP_VER}-gd" "php${PHP_VER}-curl" "php${PHP_VER}-xml" \
+  "php${PHP_VER}-zip" "php${PHP_VER}-mbstring" "php${PHP_VER}-intl" "php${PHP_VER}-bcmath" \
+  "php${PHP_VER}-gmp" "php${PHP_VER}-bz2" "php${PHP_VER}-imagick" \
+  "php${PHP_VER}-redis" "php${PHP_VER}-apcu" \
+  "libapache2-mod-php${PHP_VER}" \
+  php-pear "php${PHP_VER}-dev"
 
-PHP_INI_FPM="/etc/php/8.3/fpm/php.ini"
-PHP_INI_CLI="/etc/php/8.3/cli/php.ini"
+# php-imap isn't packaged for PHP 8.4+ on some Ubuntu releases; PECL-build
+# it from source in that case so Mail/notifications keep working.
+if apt-get install -y -qq "php${PHP_VER}-imap" 2>/dev/null; then
+  :
+elif [[ ! -f "/etc/php/${PHP_VER}/mods-available/imap.ini" ]]; then
+  apt-get install -y -qq libc-client-dev libkrb5-dev >/dev/null
+  if echo "" | pecl install imap >/dev/null 2>&1; then
+    echo "extension=imap.so" > "/etc/php/${PHP_VER}/mods-available/imap.ini"
+    phpenmod -v "${PHP_VER}" imap
+    log_success "php-imap built via PECL (php${PHP_VER}-imap not packaged by Ubuntu yet)."
+  else
+    log_warn "php${PHP_VER}-imap unavailable and the PECL build failed -- IMAP-dependent features will be limited."
+  fi
+fi
+
+PHP_INI_FPM="/etc/php/${PHP_VER}/fpm/php.ini"
+PHP_INI_CLI="/etc/php/${PHP_VER}/cli/php.ini"
 
 for PHP_INI in "$PHP_INI_FPM" "$PHP_INI_CLI"; do
   sed -i 's/^;*\s*memory_limit =.*/memory_limit = 1G/'              "$PHP_INI"
@@ -238,9 +264,9 @@ apc.shm_size=128M
 APCU
 fi
 
-systemctl enable --now php8.3-fpm
-systemctl reload php8.3-fpm
-log_success "PHP 8.3 with OPcache+JIT and APCu configured."
+systemctl enable --now "php${PHP_VER}-fpm"
+systemctl reload "php${PHP_VER}-fpm"
+log_success "PHP ${PHP_VER} with OPcache+JIT and APCu configured."
 
 # ============================================================
 log_step "Step 3: Apache web server"
@@ -251,7 +277,7 @@ a2enmod rewrite headers env dir mime ssl http2 \
         proxy proxy_http proxy_fcgi proxy_wstunnel \
         setenvif expires || true
 
-a2enconf php8.3-fpm 2>/dev/null || true
+a2enconf "php${PHP_VER}-fpm" 2>/dev/null || true
 a2dismod mpm_prefork 2>/dev/null || true
 a2enmod mpm_event 2>/dev/null || true
 a2dissite 000-default 2>/dev/null || true
@@ -1567,7 +1593,7 @@ log_step "Step 18: Fix Imagick SVG support"
 apt-get install -y -qq libmagickwand-dev 2>/dev/null || true
 if command -v pecl &>/dev/null; then
   pecl install --quiet imagick <<< "yes" || true
-  systemctl restart php8.3-fpm
+  systemctl restart "php${PHP_VER}-fpm"
   log_success "Imagick rebuilt with SVG support."
 else
   log_warn "pecl not found -- skipping Imagick rebuild."
@@ -1631,7 +1657,7 @@ $OCC maintenance:update:htaccess >> "${LOG_FILE}" 2>&1 || true
 
 # -- 4. Restart bare-metal services (order: Redis → PHP → others) -
 systemctl restart redis-server                 2>/dev/null || true
-systemctl restart php8.3-fpm                   2>/dev/null || true
+systemctl restart "php${PHP_VER}-fpm" 2>/dev/null || true
 systemctl restart apache2                      2>/dev/null || true
 systemctl restart notify_push                  2>/dev/null || true
 systemctl restart signaling                    2>/dev/null || true
@@ -1835,7 +1861,7 @@ log_step "Step 22: Final service restart & checks"
 # (occ maintenance:install, no web wizard). Just restart services.
 
 systemctl restart redis-server 2>/dev/null || true
-systemctl restart php8.3-fpm 2>/dev/null || true
+systemctl restart "php${PHP_VER}-fpm" 2>/dev/null || true
 systemctl restart apache2 2>/dev/null || true
 systemctl restart signaling 2>/dev/null \
   || systemctl restart nextcloud-spreed-signaling 2>/dev/null || true
@@ -1870,7 +1896,7 @@ echo -e "  Timezone:         ${CYAN}${DETECTED_TZ}${NC}"
 echo -e "  Install time:     ${CYAN}${TOTAL_TIME}${NC}"
 echo ""
 echo -e "${BOLD}Stack:${NC}"
-echo -e "  PHP:              ${CYAN}8.3 + OPcache/JIT + APCu (Sury)${NC}"
+echo -e "  PHP:              ${CYAN}${PHP_VER} + OPcache/JIT + APCu${NC}"
 echo -e "  Cache:            ${CYAN}Redis (socket or TCP) + APCu${NC}"
 echo -e "  Push:             ${CYAN}notify_push (arch: $(uname -m))${NC}"
 echo -e "  TURN:             ${CYAN}coturn :3478 TCP/UDP${NC}"
