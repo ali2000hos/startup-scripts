@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.0.1
+# install-nextcloud.sh -- version: 1.0.2
 #
 # Non-interactive Nextcloud installer for a fresh Ubuntu server.
 # PHP 8.3 + Apache + PostgreSQL + Redis, coturn (Talk TURN), a high-performance
@@ -157,6 +157,12 @@ log_success "Base packages installed."
 log_step "Step 2: PHP 8.3 via Sury repository"
 # ============================================================
 UBUNTU_CODENAME=$(lsb_release -sc)
+
+# php8.3-fpm lives in the "universe" component, which some minimal cloud
+# images ship disabled -- enable it before deciding an external repo is
+# needed, since Ubuntu 24.04+ already carries php8.3 in its own archive.
+add-apt-repository -y universe >/dev/null 2>&1 || true
+apt-get update -qq
 
 if apt-cache show php8.3-fpm 2>/dev/null | grep -q '^Version:'; then
   log_success "PHP 8.3 is available directly from Ubuntu's own archive -- no external repo needed."
