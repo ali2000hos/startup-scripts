@@ -270,10 +270,20 @@ apt-get install -y -qq \
   "libapache2-mod-php${PHP_VER}" \
   php-pear "php${PHP_VER}-dev"
 
-# php-imap only powers the optional Mail app / IMAP external storage --
-# not available for every PHP version yet, so it must not block the install.
-apt-get install -y -qq "php${PHP_VER}-imap" 2>/dev/null \
-  || log_warn "php${PHP_VER}-imap not available -- Nextcloud Mail app's IMAP features will be limited."
+# php-imap was pulled from PHP core in 8.4+; Ubuntu doesn't package it for
+# 8.4/8.5 yet, so fall back to building it from PECL against c-client.
+if apt-get install -y -qq "php${PHP_VER}-imap" 2>/dev/null; then
+  :
+elif [[ ! -f "/etc/php/${PHP_VER}/mods-available/imap.ini" ]]; then
+  apt-get install -y -qq "php${PHP_VER}-dev" libc-client-dev libkrb5-dev >/dev/null
+  if pecl install imap <<< '' >/dev/null 2>&1; then
+    echo "extension=imap.so" > "/etc/php/${PHP_VER}/mods-available/imap.ini"
+    phpenmod -v "${PHP_VER}" imap
+    log_success "php-imap built via PECL (php${PHP_VER}-imap not packaged by Ubuntu yet)."
+  else
+    log_warn "php${PHP_VER}-imap unavailable and the PECL build failed -- IMAP-dependent features will be limited."
+  fi
+fi
 
 PHP_INI_FPM="/etc/php/${PHP_VER}/fpm/php.ini"
 PHP_INI_CLI="/etc/php/${PHP_VER}/cli/php.ini"
