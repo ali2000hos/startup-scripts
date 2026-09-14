@@ -1796,9 +1796,8 @@ log_success "Log rotation configured (14 days)."
 
 log_step "Step 22: Final service restart & checks"
 # ============================================================
-# Nextcloud is not yet installed at this point (wizard pending).
-# occ commands run after the user completes the wizard via post-setup.sh.
-# Only restart infrastructure services here.
+# Nextcloud is already fully installed and configured by Step 16
+# (occ maintenance:install, no web wizard). Just restart services.
 
 systemctl restart redis-server 2>/dev/null || true
 systemctl restart php8.3-fpm 2>/dev/null || true
