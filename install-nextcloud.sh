@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 2.0.0
+# install-nextcloud.sh -- version: 1.0.0
 #
 # Non-interactive Nextcloud installer for a fresh Ubuntu server.
 # PHP 8.3 + Apache + PostgreSQL + Redis, coturn (Talk TURN), a high-performance
