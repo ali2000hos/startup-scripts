@@ -1,10 +1,10 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.1.0
+# install-nextcloud.sh -- version: 1.2.0
 #
 # Nextcloud installer for a fresh Ubuntu server. Provisions everything up
 # front (PHP 8.3-8.5 auto-detected, Apache, PostgreSQL, Redis, coturn, a
 # high-performance Talk signaling backend, Docker stack -- Imaginary,
-# Elasticsearch, Whiteboard, Talk Recording, Euro-Office, HaRP -- Let's
+# Elasticsearch, Whiteboard, Euro-Office, HaRP -- Let's
 # Encrypt TLS, backups) then pre-fills the DB (and S3, if configured) so you
 # finish setup by hand in the browser via Nextcloud's own wizard, choosing
 # your own admin username/password. Apps and remaining config finish
@@ -452,7 +452,7 @@ log_success "BorgBackup installed."
 log_step "Step 8: Install Docker & Docker Compose"
 # ============================================================
 # Docker is required for the heavy services: Imaginary, Elasticsearch,
-# Whiteboard, Talk Recording, Janus, and Docker Socket Proxy.
+# Whiteboard, Janus, and Docker Socket Proxy.
 if ! command -v docker &>/dev/null; then
   log_info "Installing Docker..."
   # Install Docker from official APT repository (no curl|sh)
@@ -764,7 +764,6 @@ mkdir -p "${DOCKER_DIR}"
 SOCK_PROXY_PASS="${SOCK_PROXY_PASS:-$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 24)}"
 ELASTIC_PASSWORD="${ELASTIC_PASSWORD:-$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 24)}"
 WHITEBOARD_SECRET="${WHITEBOARD_SECRET:-$(openssl rand -hex 32)}"
-RECORDING_SECRET="${RECORDING_SECRET:-$(openssl rand -hex 32)}"
 EUROOFFICE_JWT_SECRET="${EUROOFFICE_JWT_SECRET:-$(openssl rand -hex 32)}"
 INTERNAL_SECRET="${INTERNAL_SECRET:-$(openssl rand -hex 32)}"
 HARP_SHARED_KEY="${HARP_SHARED_KEY:-$(openssl rand -hex 32)}"
@@ -776,7 +775,6 @@ DOCKER_DIR=${DOCKER_DIR}
 SOCK_PROXY_PASS=${SOCK_PROXY_PASS}
 ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
 WHITEBOARD_SECRET=${WHITEBOARD_SECRET}
-RECORDING_SECRET=${RECORDING_SECRET}
 EUROOFFICE_JWT_SECRET=${EUROOFFICE_JWT_SECRET}
 INTERNAL_SECRET=${INTERNAL_SECRET}
 HARP_SHARED_KEY=${HARP_SHARED_KEY}
@@ -822,72 +820,6 @@ fi
 
 log_success "Farsi/Arabic fonts installed."
 
-# Patched start.sh for talk-recording: uses https:// for backend (REST API)
-# but wss:// for signaling (WebSocket). The original start.sh uses a single
-# HPB_PROTOCOL for both, which breaks one of them.
-cat > "${DOCKER_DIR}/recording-start.sh" <<'RECEOF'
-#!/bin/bash
-if [ -z "$NC_DOMAIN" ]; then
-    echo "You need to provide the NC_DOMAIN."
-    exit 1
-elif [ -z "$RECORDING_SECRET" ]; then
-    echo "You need to provide the RECORDING_SECRET."
-    exit 1
-elif [ -z "$INTERNAL_SECRET" ]; then
-    echo "You need to provide the INTERNAL_SECRET."
-    exit 1
-fi
-
-if [ -z "$HPB_DOMAIN" ]; then
-    export HPB_DOMAIN="$NC_DOMAIN"
-fi
-
-rm -fr /tmp/{*,.*}
-
-# Backend uses https:// (REST API), signaling uses wss:// (WebSocket)
-BACKEND_URL="${HPB_PROTOCOL:-https}://${NC_DOMAIN}"
-SIGNALING_URL="wss://${HPB_DOMAIN}${HPB_PATH}"
-
-cat << RECORDING_CONF > "/conf/recording.conf"
-[logs]
-level = 30
-
-[http]
-listen = 0.0.0.0:1234
-
-[backend]
-allowall = ${ALLOW_ALL}
-secret = ${RECORDING_SECRET}
-backends = backend-1
-skipverify = ${SKIP_VERIFY}
-maxmessagesize = 1024
-videowidth = 1920
-videoheight = 1080
-directory = /tmp
-
-[backend-1]
-url = ${BACKEND_URL}
-secret = ${RECORDING_SECRET}
-skipverify = ${SKIP_VERIFY}
-
-[signaling]
-signalings = signaling-1
-
-[signaling-1]
-url = ${SIGNALING_URL}
-internalsecret = ${INTERNAL_SECRET}
-
-[ffmpeg]
-extensionaudio = .ogg
-extensionvideo = .webm
-
-[recording]
-browser = firefox
-RECORDING_CONF
-
-exec "$@"
-RECEOF
-chmod +x "${DOCKER_DIR}/recording-start.sh"
 
 cat > "${DOCKER_DIR}/docker-compose.yml" <<COMPOSEEOF
 # Nextcloud Full -- Docker services
@@ -955,25 +887,6 @@ services:
     network_mode: host
     environment:
       - JANUS_RTP_PORT_RANGE=20000-40000
-
-  talk-recording:
-    image: nextcloud/aio-talk-recording:latest
-    container_name: nc-talk-recording
-    restart: unless-stopped
-    network_mode: host
-    depends_on:
-      - janus
-    environment:
-      - INTERNAL_SECRET=${INTERNAL_SECRET}
-      - NC_DOMAIN=${NC_DOMAIN}
-      - RECORDING_SECRET=${RECORDING_SECRET}
-      - SIGNALING_SECRET=${SIGNALING_SECRET}
-      - HPB_PROTOCOL=https
-      - HPB_PATH=/standalone-signaling/
-      - JANUS_URL=ws://127.0.0.1:8188
-    volumes:
-      - nc-recording-data:/data
-      - ${DOCKER_DIR}/recording-start.sh:/start.sh:ro
 
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:latest
@@ -1053,7 +966,6 @@ services:
 
 volumes:
   nc-elasticsearch-data:
-  nc-recording-data:
   nc-eurooffice-data:
   nc-eurooffice-config:
   nc-eurooffice-logs:
@@ -1079,20 +991,20 @@ docker compose -f "${DOCKER_DIR}/docker-compose.yml" up -d || {
 log_info "Waiting for Docker services to be ready..."
 for i in $(seq 1 60); do
   RUNNING=$(docker compose -f "${DOCKER_DIR}/docker-compose.yml" ps --status running --quiet 2>/dev/null | wc -l | tr -d '[:space:]')
-  HEALTHY=$(docker inspect --format='{{.State.Health.Status}}' nc-euro-office nc-whiteboard nc-talk-recording appapi-harp 2>/dev/null | grep -c "healthy" | tr -d '[:space:]' || true)
+  HEALTHY=$(docker inspect --format='{{.State.Health.Status}}' nc-euro-office nc-whiteboard appapi-harp 2>/dev/null | grep -c "healthy" | tr -d '[:space:]' || true)
   HEALTHY=${HEALTHY:-0}
-  if [ "${RUNNING}" -ge 9 ] && [ "${HEALTHY}" -ge 3 ]; then
+  if [ "${RUNNING}" -ge 8 ] && [ "${HEALTHY}" -ge 3 ]; then
     break
   fi
   sleep 5
 done
 
 RUNNING=$(docker compose -f "${DOCKER_DIR}/docker-compose.yml" ps --status running --quiet 2>/dev/null | wc -l | tr -d '[:space:]')
-HEALTHY=$(docker inspect --format='{{.State.Health.Status}}' nc-euro-office nc-whiteboard nc-talk-recording appapi-harp 2>/dev/null | grep -c "healthy" | tr -d '[:space:]' || true)
+HEALTHY=$(docker inspect --format='{{.State.Health.Status}}' nc-euro-office nc-whiteboard appapi-harp 2>/dev/null | grep -c "healthy" | tr -d '[:space:]' || true)
 HEALTHY=${HEALTHY:-0}
-log_success "Docker services started: ${RUNNING}/9 containers running, ${HEALTHY}/4 healthy."
+log_success "Docker services started: ${RUNNING}/8 containers running, ${HEALTHY}/3 healthy."
 if [ "${HEALTHY}" -lt 3 ]; then
-  log_warn "Only ${HEALTHY}/4 services healthy. Some may need manual attention."
+  log_warn "Only ${HEALTHY}/3 services healthy. Some may need manual attention."
 fi
 
 # ============================================================
@@ -1409,22 +1321,6 @@ else
   log "Euro-Office not responding on :9980 -- skipping config."
 fi
 
-# Talk Recording
-log "Waiting for Talk Recording server..."
-for i in $(seq 1 60); do
-  curl -s http://127.0.0.1:1234/api/v1/welcome 2>/dev/null | grep -qi "version\|recording\|welcome" && break
-  sleep 5
-done
-if curl -s http://127.0.0.1:1234/api/v1/welcome 2>/dev/null | grep -qi "version\|recording\|welcome"; then
-  $OCC config:app:set spreed recording_backend --value="internal" 2>/dev/null || true
-  $OCC config:app:set spreed recording_servers \
-    --value="{\"servers\":[{\"server\":\"https://${NC_DOMAIN}/recording\",\"secret\":\"${RECORDING_SECRET}\",\"verify\":false}],\"secret\":\"${RECORDING_SECRET}\"}" \
-    2>/dev/null || true
-  log "Talk Recording configured."
-else
-  log "Talk Recording not responding on :1234 -- skipping config."
-fi
-
 # AppAPI (HaRP or Docker Socket Proxy)
 log "Waiting for AppAPI/HaRP..."
 for i in $(seq 1 60); do
@@ -1492,7 +1388,7 @@ POSTCRONEOF
 chmod 644 /etc/cron.d/nextcloud-post-setup
 log_success "post-setup.sh created -- will run automatically once you finish the wizard."
 
-# Apache proxy for Whiteboard WebSocket, Talk Recording, and HaRP ExApps
+# Apache proxy for Whiteboard WebSocket and HaRP ExApps
 for CONF in /etc/apache2/sites-available/nextcloud-le-ssl.conf \
             /etc/apache2/sites-available/nextcloud.conf; do
   if [[ -f "${CONF}" ]]; then
@@ -1504,11 +1400,6 @@ injected = False
 # Whiteboard: /socket.io/
 if '/socket.io/' not in c:
     inject = '    # Whiteboard WebSocket\n    RewriteEngine On\n    RewriteCond %{HTTP:Upgrade} =websocket [NC]\n    RewriteRule /socket.io/(.*) ws://127.0.0.1:3002/socket.io/\$1 [P,L]\n    RewriteCond %{HTTP:Upgrade} !=websocket [NC]\n    RewriteRule /socket.io/(.*) http://127.0.0.1:3002/socket.io/\$1 [P,L]\n    ProxyPassReverse /socket.io/ http://127.0.0.1:3002/socket.io/\n'
-    c = c.replace('</VirtualHost>', inject + '</VirtualHost>', 1)
-    injected = True
-# Talk Recording proxy
-if '/recording/' not in c:
-    inject = '    # Talk Recording server\n    ProxyPass        /recording/ http://127.0.0.1:1234/\n    ProxyPassReverse /recording/ http://127.0.0.1:1234/\n'
     c = c.replace('</VirtualHost>', inject + '</VirtualHost>', 1)
     injected = True
 # HaRP ExApps proxy
@@ -2011,7 +1902,6 @@ echo -e "  ${CYAN}Imaginary          -- image preview :9000${NC}"
 echo -e "  ${CYAN}Elasticsearch      -- full text search :9200${NC}"
 echo -e "  ${CYAN}Whiteboard         -- collaborative whiteboard :3002${NC}"
 echo -e "  ${CYAN}Euro-Office        -- online office editing :9980${NC}"
-echo -e "  ${CYAN}Talk Recording     -- call recording :1234${NC}"
 echo -e "  ${CYAN}Janus              -- WebRTC gateway${NC}"
 echo -e "  ${CYAN}Docker Socket Proxy-- AppAPI access :2375${NC}"
 echo -e "  ${CYAN}Watchtower         -- auto-updates Docker images (daily 03:00)${NC}"
