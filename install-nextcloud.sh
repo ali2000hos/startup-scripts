@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-nextcloud.sh -- version: 1.3.0
+# install-nextcloud.sh -- version: 1.4.0
 #
 # Nextcloud installer for a fresh Ubuntu server. Provisions everything up
 # front (PHP 8.3-8.5 auto-detected, Apache, PostgreSQL, Redis, coturn, a
@@ -1022,10 +1022,69 @@ grep -q "vm.max_map_count" /etc/sysctl.conf 2>/dev/null \
   || echo "vm.max_map_count=262144" >> /etc/sysctl.conf
 
 log_info "Starting Docker services..."
-if ! docker compose -f "${DOCKER_DIR}/docker-compose.yml" pull --quiet; then
-  log_warn "Some images failed to pull -- continuing with available images."
+
+# Some registries (docker.elastic.co, ghcr.io) are unreliable or blocked on
+# certain networks (notably Iran). A single failed pull inside `compose up`
+# aborts the *entire* stack, so pull each image separately with retries and
+# only start the services that actually succeeded -- one broken registry no
+# longer takes down the other 7 containers.
+#
+# If Docker Hub itself looks unreachable, fall back to registry mirrors
+# commonly used on Iranian networks (same idea as the iran-docker project:
+# https://github.com/Linuxmaster14/iran-docker). This only touches
+# /etc/docker/daemon.json when the default registry is actually unreachable,
+# so it's a no-op on international servers.
+if ! curl -sf --max-time 5 https://registry-1.docker.io/v2/ -o /dev/null; then
+  log_warn "registry-1.docker.io unreachable -- adding Iran-friendly registry mirrors as fallback."
+  mkdir -p /etc/docker
+  backup_config /etc/docker/daemon.json
+  python3 -c "
+import json, os
+path = '/etc/docker/daemon.json'
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+cfg['registry-mirrors'] = [
+    'https://docker.arvancloud.ir',
+    'https://docker.iranserver.com',
+    'https://docker-mirror.liara.ir',
+]
+with open(path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+  systemctl restart docker
+  sleep 3
 fi
-docker compose -f "${DOCKER_DIR}/docker-compose.yml" up -d || {
+
+DOCKER_SERVICES=$(docker compose -f "${DOCKER_DIR}/docker-compose.yml" config --services)
+STARTABLE_SERVICES=()
+for svc in ${DOCKER_SERVICES}; do
+  pulled=false
+  for attempt in 1 2 3; do
+    if docker compose -f "${DOCKER_DIR}/docker-compose.yml" pull --quiet "${svc}" >> "${LOG_DIR}/app-install.log" 2>&1; then
+      pulled=true
+      break
+    fi
+    sleep 5
+  done
+  if $pulled; then
+    STARTABLE_SERVICES+=("${svc}")
+  else
+    log_warn "Image for '${svc}' could not be pulled after 3 attempts -- skipping this service."
+  fi
+done
+
+if [ ${#STARTABLE_SERVICES[@]} -eq 0 ]; then
+  log_error "No Docker images could be pulled. Check network access to Docker registries."
+  log_error "Check: docker compose -f ${DOCKER_DIR}/docker-compose.yml logs"
+  exit 1
+fi
+
+docker compose -f "${DOCKER_DIR}/docker-compose.yml" up -d "${STARTABLE_SERVICES[@]}" || {
   log_error "Failed to start Docker services."
   log_error "Check: docker compose -f ${DOCKER_DIR}/docker-compose.yml logs"
   log_error "You may need to fix the issue and re-run the script."
@@ -1037,7 +1096,7 @@ for i in $(seq 1 60); do
   RUNNING=$(docker compose -f "${DOCKER_DIR}/docker-compose.yml" ps --status running --quiet 2>/dev/null | wc -l | tr -d '[:space:]')
   HEALTHY=$(docker inspect --format='{{.State.Health.Status}}' nc-euro-office nc-whiteboard appapi-harp 2>/dev/null | grep -c "healthy" | tr -d '[:space:]' || true)
   HEALTHY=${HEALTHY:-0}
-  if [ "${RUNNING}" -ge 8 ] && [ "${HEALTHY}" -ge 3 ]; then
+  if [ "${RUNNING}" -ge "${#STARTABLE_SERVICES[@]}" ] && [ "${HEALTHY}" -ge 3 ]; then
     break
   fi
   sleep 5
@@ -1046,7 +1105,7 @@ done
 RUNNING=$(docker compose -f "${DOCKER_DIR}/docker-compose.yml" ps --status running --quiet 2>/dev/null | wc -l | tr -d '[:space:]')
 HEALTHY=$(docker inspect --format='{{.State.Health.Status}}' nc-euro-office nc-whiteboard appapi-harp 2>/dev/null | grep -c "healthy" | tr -d '[:space:]' || true)
 HEALTHY=${HEALTHY:-0}
-log_success "Docker services started: ${RUNNING}/8 containers running, ${HEALTHY}/3 healthy."
+log_success "Docker services started: ${RUNNING}/${#STARTABLE_SERVICES[@]} containers running, ${HEALTHY}/3 healthy."
 if [ "${HEALTHY}" -lt 3 ]; then
   log_warn "Only ${HEALTHY}/3 services healthy. Some may need manual attention."
 fi
